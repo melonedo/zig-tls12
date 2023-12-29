@@ -12,12 +12,13 @@ const assert = std.debug.assert;
 const Client = @This();
 const proto = std.http.protocol;
 const TlsClient = @import("TlsClient.zig");
+const Certificate = @import("crypto/Certificate.zig");
 
 pub const default_connection_pool_size = 32;
 pub const connection_pool_size = std.options.http_connection_pool_size;
 
 allocator: Allocator,
-ca_bundle: std.crypto.Certificate.Bundle = .{},
+ca_bundle: Certificate.Bundle = .{},
 ca_bundle_mutex: std.Thread.Mutex = .{},
 /// When this is `true`, the next time this client performs an HTTPS request,
 /// it will first rescan the system for root certificates.

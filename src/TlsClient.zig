@@ -5,7 +5,7 @@ const net = std.net;
 const mem = std.mem;
 const crypto = std.crypto;
 const assert = std.debug.assert;
-const Certificate = std.crypto.Certificate;
+const Certificate = @import("crypto/Certificate.zig");
 
 const max_ciphertext_len = tls.max_ciphertext_len;
 const hkdfExpandLabel = tls.hkdfExpandLabel;
@@ -156,36 +156,16 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         // Only possible to happen if the private key is all zeroes.
         error.IdentityElement => return error.InsufficientEntropy,
     };
-    const kyber768_kp = crypto.kem.kyber_d00.Kyber768.KeyPair.create(null) catch {};
 
     const extensions_payload =
         tls.extension(.supported_versions, [_]u8{
         0x02, // byte length of supported versions
-        0x03, 0x04, // TLS 1.3
+        0x03, 0x03, // TLS 1.2
     }) ++ tls.extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
-        .ecdsa_secp256r1_sha256,
-        .ecdsa_secp384r1_sha384,
-        .ecdsa_secp521r1_sha512,
-        .rsa_pss_rsae_sha256,
-        .rsa_pss_rsae_sha384,
-        .rsa_pss_rsae_sha512,
         .rsa_pkcs1_sha256,
         .rsa_pkcs1_sha384,
         .rsa_pkcs1_sha512,
-        .ed25519,
-    })) ++ tls.extension(.supported_groups, enum_array(tls.NamedGroup, &.{
-        .x25519_kyber768d00,
-        .secp256r1,
-        .x25519,
-    })) ++ tls.extension(
-        .key_share,
-        array(1, int2(@intFromEnum(tls.NamedGroup.x25519)) ++
-            array(1, x25519_kp.public_key) ++
-            int2(@intFromEnum(tls.NamedGroup.secp256r1)) ++
-            array(1, secp256r1_kp.public_key.toUncompressedSec1()) ++
-            int2(@intFromEnum(tls.NamedGroup.x25519_kyber768d00)) ++
-            array(1, x25519_kp.public_key ++ kyber768_kp.public_key.toBytes())),
-    ) ++
+    })) ++
         int2(@intFromEnum(tls.ExtensionType.server_name)) ++
         int2(host_len + 5) ++ // byte length of this extension payload
         int2(host_len + 3) ++ // server_name_list byte count
@@ -310,20 +290,6 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                             const key_size = extd.decode(u16);
                             try extd.ensure(key_size);
                             switch (named_group) {
-                                .x25519_kyber768d00 => {
-                                    const xksl = crypto.dh.X25519.public_length;
-                                    const hksl = xksl + crypto.kem.kyber_d00.Kyber768.ciphertext_length;
-                                    if (key_size != hksl)
-                                        return error.TlsIllegalParameter;
-                                    const server_ks = extd.array(hksl);
-
-                                    shared_key = &((crypto.dh.X25519.scalarmult(
-                                        x25519_kp.secret_key,
-                                        server_ks[0..xksl].*,
-                                    ) catch return error.TlsDecryptFailure) ++ (kyber768_kp.secret_key.decaps(
-                                        server_ks[xksl..hksl],
-                                    ) catch return error.TlsDecryptFailure));
-                                },
                                 .x25519 => {
                                     const ksl = crypto.dh.X25519.public_length;
                                     if (key_size != ksl) return error.TlsIllegalParameter;
@@ -455,13 +421,13 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         // TODO: implement DHE
         assert(is_ecc);
 
-        try hsd.ensure(5);
+        try hsd.ensure(4);
         const curve_type = hsd.decode(ECCurveType);
         if (curve_type != .named_curve) return error.TlsIllegalParameter;
         named_group = hsd.decode(tls13.NamedGroup);
         const key_size = hsd.decode(u8);
         try hsd.ensure(key_size);
-        const parameter_bytes = hsd.buf[hsd.idx - 4 ..][0 .. 5 + key_size];
+        const parameter_bytes = hsd.buf[hsd.idx - 4 ..][0 .. 4 + key_size];
         switch (named_group) {
             .x25519 => {
                 const ksl = crypto.dh.X25519.public_length;
@@ -491,6 +457,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         }
 
         // verify certificate
+        // TODO: RFC 7627 Extended Master Secret Extension
         try hsd.ensure(4);
         const scheme = hsd.decode(tls13.SignatureScheme);
         const sig_len = hsd.decode(u16);
@@ -507,7 +474,6 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         @memcpy(verify_buf[64 .. 64 + parameter_bytes.len], parameter_bytes);
         const verify_bytes = verify_buf[0 .. 64 + parameter_bytes.len];
 
-        // TODO: must implement rsa_pkcs1_shaXXX to proceed
         switch (scheme) {
             inline .ecdsa_secp256r1_sha256,
             .ecdsa_secp384r1_sha384,
@@ -541,6 +507,14 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                         return error.TlsBadRsaSignatureBitCount;
                     },
                 }
+            },
+            inline .rsa_pkcs1_sha1,
+            .rsa_pkcs1_sha256,
+            .rsa_pkcs1_sha384,
+            .rsa_pkcs1_sha512,
+            => |comptime_scheme| {
+                const Hash = SchemeHash(comptime_scheme);
+                try Certificate.verifyRsa(Hash, verify_bytes, encoded_sig, .rsaEncryption, main_cert_pub_key);
             },
             else => {
                 return error.TlsBadSignatureScheme;
@@ -1205,6 +1179,11 @@ pub fn SchemeHash(comptime scheme: tls.SignatureScheme) type {
         .rsa_pss_rsae_sha256 => crypto.hash.sha2.Sha256,
         .rsa_pss_rsae_sha384 => crypto.hash.sha2.Sha384,
         .rsa_pss_rsae_sha512 => crypto.hash.sha2.Sha512,
+
+        .rsa_pkcs1_sha1 => crypto.hash.Sha1,
+        .rsa_pkcs1_sha256 => crypto.hash.sha2.Sha256,
+        .rsa_pkcs1_sha384 => crypto.hash.sha2.Sha384,
+        .rsa_pkcs1_sha512 => crypto.hash.sha2.Sha512,
         else => @compileError("bad scheme"),
     };
 }

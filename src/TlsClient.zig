@@ -300,9 +300,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
 
             prev_cert = subject;
             cert_index += 1;
-        }
-        // NOTE: for testing
-        else return error.TlsAlertUnknownCa;
+        } else return error.TlsAlertUnknownCa;
     }
 
     // Server Key Exchange Message
@@ -555,21 +553,22 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         const rest = d.rest();
         client.partial_ciphertext_end = @intCast(rest.len);
         @memcpy(client.partially_read_buffer[0..rest.len], rest);
-        // const handshake_type = ptd.decode(HandshakeType);
-        // if (handshake_type != .finished) return error.TlsUnexpectedMessage;
-        // const length = ptd.decode(u24);
-        // if (length != 12) return error.TlsDecodeError;
-        // var hsd = try ptd.sub(length);
-        // try hsd.ensure(12);
-        // const server_verify = hsd.array(12);
         var handshake: [16]u8 = undefined;
-        const total = try client.read(stream, &handshake);
-        assert(total == 16);
+        _ = try client.read(stream, &handshake);
+        var ptd = tls.Decoder.fromTheirSlice(&handshake);
+        try ptd.ensure(4);
+        const handshake_type = ptd.decode(HandshakeType);
+        if (handshake_type != .finished) return error.TlsUnexpectedMessage;
+        const length = ptd.decode(u24);
+        if (length != 12) return error.TlsDecodeError;
+        try ptd.ensure(12);
+        const server_verify = ptd.array(12);
         const verify_data = switch (hash) {
-            inline else => |*h| PRF(crypto.auth.hmac.Hmac(@TypeOf(h.*)), &master_secret, "client finished", &h.finalResult(), 12),
+            inline else => |*h| PRF(crypto.auth.hmac.Hmac(@TypeOf(h.*)), &master_secret, "server finished", &h.finalResult(), 12),
         };
-        std.debug.print("{}", .{std.fmt.fmtSliceHexLower(&verify_data)});
-        // if (mem.eql(u8, server_verify, &verify_data)) return error.TlsHandshakeFailure;
+        std.debug.print("{} {}", .{ std.fmt.fmtSliceHexLower(&verify_data), std.fmt.fmtSliceHexLower(server_verify) });
+        if (!mem.eql(u8, server_verify, &verify_data))
+            return error.TlsHandshakeFailure;
     }
 
     return client;
@@ -864,15 +863,27 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     const wanted_read_len = buf_cap * (max_ciphertext_len + tls.record_header_len);
     const ask_len = @max(wanted_read_len, cleartext_stack_buffer.len);
     const ask_iovecs = limitVecs(&ask_iovecs_buf, ask_len);
-    const actual_read_len = try stream.readv(ask_iovecs);
-    if (actual_read_len == 0) {
-        // This is either a truncation attack, a bug in the server, or an
-        // intentional omission of the close_notify message due to truncation
-        // detection handled above the TLS layer.
-        if (c.allow_truncation_attacks) {
-            c.received_close_notify = true;
-        } else {
-            return error.TlsConnectionTruncated;
+
+    var actual_read_len: usize = 0;
+    readv: {
+        // If there is already a complete record, then skip `readv`
+        // This may happen in first call to `readvAdvanced`,
+        // because c.partially_read_buffer is copied from the decoder.
+        if (c.partial_ciphertext_end > 0) {
+            const record_len = mem.readInt(u16, c.partially_read_buffer[3..5], .big);
+            if (record_len + 5 <= c.partial_ciphertext_end)
+                break :readv;
+        }
+        actual_read_len = try stream.readv(ask_iovecs);
+        if (actual_read_len == 0) {
+            // This is either a truncation attack, a bug in the server, or an
+            // intentional omission of the close_notify message due to truncation
+            // detection handled above the TLS layer.
+            if (c.allow_truncation_attacks) {
+                c.received_close_notify = true;
+            } else {
+                return error.TlsConnectionTruncated;
+            }
         }
     }
 
@@ -929,7 +940,6 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         in += 1;
         const legacy_version = mem.readInt(u16, frag[in..][0..2], .big);
         in += 2;
-        _ = legacy_version;
         const record_len = mem.readInt(u16, frag[in..][0..2], .big);
         if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
         in += 2;
@@ -971,7 +981,6 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                     inline else => |*p| c: {
                         const P = @TypeOf(p.*);
                         const V = @Vector(P.AEAD.nonce_length, u8);
-                        const ad = frag[in - 5 ..][0..5];
                         const ciphertext_len = record_len - P.AEAD.tag_length - P.explicit_nonce_len;
                         const explicit_nonce = frag[in..][0..P.explicit_nonce_len].*;
                         in += explicit_nonce.len;
@@ -979,10 +988,15 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                         in += ciphertext_len;
                         const auth_tag = frag[in..][0..P.AEAD.tag_length].*;
                         const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                        const operand: V = pad ++ @as([8]u8, @bitCast(big(c.read_seq)));
-                        var nonce: [P.AEAD.nonce_length]u8 = @as(V, p.server_iv) ^ operand;
+                        const seq_big = @as([8]u8, @bitCast(big(c.read_seq)));
+                        var nonce: [P.AEAD.nonce_length]u8 = undefined;
                         if (explicit_nonce.len != 0) {
-                            nonce[P.AEAD.nonce_length - explicit_nonce.len .. P.AEAD.nonce_length].* = explicit_nonce;
+                            const implicit_nonce_len = P.AEAD.nonce_length - explicit_nonce.len;
+                            nonce[0..implicit_nonce_len].* = p.server_iv[0..implicit_nonce_len].*;
+                            nonce[implicit_nonce_len..P.AEAD.nonce_length].* = explicit_nonce;
+                        } else {
+                            const operand: V = pad ++ seq_big;
+                            nonce = @as(V, p.server_iv) ^ operand;
                         }
                         const out_buf = vp.peek();
                         const cleartext_buf = if (ciphertext.len <= out_buf.len)
@@ -990,7 +1004,11 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                         else
                             &cleartext_stack_buffer;
                         const cleartext = cleartext_buf[0..ciphertext.len];
-                        P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, p.server_key) catch
+                        const ad = seq_big ++
+                            [1]u8{@intFromEnum(ct)} ++
+                            int2(legacy_version) ++
+                            int2(@intCast(ciphertext_len));
+                        P.AEAD.decrypt(cleartext, ciphertext, auth_tag, &ad, nonce, p.server_key) catch
                             return error.TlsBadRecordMac;
                         break :c cleartext;
                     },
@@ -998,55 +1016,33 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
 
                 c.read_seq = try std.math.add(u64, c.read_seq, 1);
 
-                const inner_ct: tls.ContentType = @enumFromInt(cleartext[cleartext.len - 1]);
-                switch (inner_ct) {
-                    .alert => {
-                        const level: tls.AlertLevel = @enumFromInt(cleartext[0]);
-                        const desc: tls.AlertDescription = @enumFromInt(cleartext[1]);
-                        if (desc == .close_notify) {
-                            c.received_close_notify = true;
-                            c.partial_ciphertext_end = c.partial_ciphertext_idx;
-                            return vp.total;
+                // Determine whether the output buffer or a stack
+                // buffer was used for storing the cleartext.
+                if (cleartext.ptr == &cleartext_stack_buffer) {
+                    // Stack buffer was used, so we must copy to the output buffer.
+                    const msg = cleartext;
+                    if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
+                        // We have already run out of room in iovecs. Continue
+                        // appending to `partially_read_buffer`.
+                        @memcpy(
+                            c.partially_read_buffer[c.partial_ciphertext_idx..][0..msg.len],
+                            msg,
+                        );
+                        c.partial_ciphertext_idx = @intCast(c.partial_ciphertext_idx + msg.len);
+                    } else {
+                        const amt = vp.put(msg);
+                        if (amt < msg.len) {
+                            const rest = msg[amt..];
+                            c.partial_cleartext_idx = 0;
+                            c.partial_ciphertext_idx = @intCast(rest.len);
+                            @memcpy(c.partially_read_buffer[0..rest.len], rest);
                         }
-                        _ = level;
-
-                        try desc.toError();
-                        // TODO: handle server-side closures
-                        return error.TlsUnexpectedMessage;
-                    },
-                    .application_data => {
-                        // Determine whether the output buffer or a stack
-                        // buffer was used for storing the cleartext.
-                        if (cleartext.ptr == &cleartext_stack_buffer) {
-                            // Stack buffer was used, so we must copy to the output buffer.
-                            const msg = cleartext[0 .. cleartext.len - 1];
-                            if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
-                                // We have already run out of room in iovecs. Continue
-                                // appending to `partially_read_buffer`.
-                                @memcpy(
-                                    c.partially_read_buffer[c.partial_ciphertext_idx..][0..msg.len],
-                                    msg,
-                                );
-                                c.partial_ciphertext_idx = @intCast(c.partial_ciphertext_idx + msg.len);
-                            } else {
-                                const amt = vp.put(msg);
-                                if (amt < msg.len) {
-                                    const rest = msg[amt..];
-                                    c.partial_cleartext_idx = 0;
-                                    c.partial_ciphertext_idx = @intCast(rest.len);
-                                    @memcpy(c.partially_read_buffer[0..rest.len], rest);
-                                }
-                            }
-                        } else {
-                            // Output buffer was used directly which means no
-                            // memory copying needs to occur, and we can move
-                            // on to the next ciphertext record.
-                            vp.next(cleartext.len - 1);
-                        }
-                    },
-                    else => {
-                        return error.TlsUnexpectedMessage;
-                    },
+                    }
+                } else {
+                    // Output buffer was used directly which means no
+                    // memory copying needs to occur, and we can move
+                    // on to the next ciphertext record.
+                    vp.next(cleartext.len);
                 }
             },
             else => {
@@ -1054,6 +1050,40 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             },
         }
         in = end;
+    }
+}
+
+// Decrypt body of a TLSCiphertext record
+// `ciphertext`: explicit_nonce + payload + authentication_tag
+// `cleartext`: output buffer, size must be payload.len.
+fn decrypt(c: *Client, ciphertext: []const u8, cleartext: []u8, content_type: tls.ContentType) !void {
+    switch (c.application_cipher) {
+        inline else => |*p| {
+            const P = @TypeOf(p.*);
+            const V = @Vector(P.AEAD.nonce_length, u8);
+            assert(ciphertext.len == cleartext.len + P.explicit_nonce_len + P.AEAD.tag_length);
+
+            // const ad = ciphertext[0..5];
+            const ciphertext_len = cleartext.len - P.AEAD.tag_length - P.explicit_nonce_len;
+            const explicit_nonce = ciphertext[0..P.explicit_nonce_len].*;
+            var begin = explicit_nonce.len;
+            const payload = ciphertext[begin..][0..ciphertext_len];
+            begin += ciphertext_len;
+            const auth_tag = ciphertext[begin..][0..P.AEAD.tag_length].*;
+            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+            const seq_big = @as([8]u8, @bitCast(big(c.read_seq)));
+            const operand: V = pad ++ seq_big;
+            var nonce: [P.AEAD.nonce_length]u8 = @as(V, p.server_iv) ^ operand;
+            if (explicit_nonce.len != 0) {
+                nonce[P.AEAD.nonce_length - explicit_nonce.len .. P.AEAD.nonce_length].* = explicit_nonce;
+            }
+            const ad = seq_big ++
+                [1]u8{@intFromEnum(content_type)} ++
+                int2(@intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                int2(@intCast(cleartext.len));
+            P.AEAD.decrypt(cleartext, payload, auth_tag, ad, nonce, p.server_key) catch
+                return error.TlsBadRecordMac;
+        },
     }
 }
 

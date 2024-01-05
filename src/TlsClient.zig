@@ -8,7 +8,6 @@ const assert = std.debug.assert;
 const Certificate = @import("crypto/Certificate.zig");
 
 const max_ciphertext_len = (1 << 14) + 2048;
-const hkdfExpandLabel = tls.hkdfExpandLabel;
 const int2 = tls.int2;
 const int3 = tls.int3;
 const array = tls.array;
@@ -468,11 +467,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
             tls.int2(@intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
             tls.int2(1) ++
             [1]u8{1};
-        var iovecs = [1]std.os.iovec_const{.{
-            .iov_base = &record,
-            .iov_len = record.len,
-        }};
-        try stream.writevAll(&iovecs);
+        try stream.writeAll(&record);
     }
 
     // Calculate Keys
@@ -497,9 +492,13 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                 c.client_key = key_material[0..key_len].*;
                 c.server_key = key_material[key_len .. 2 * key_len].*;
                 const iv_material = key_material[2 * key_len ..];
-                c.client_iv = iv_material[0..nonce_len].* ++ [1]u8{0} ** 8;
+                c.client_iv[0..nonce_len].* = iv_material[0..nonce_len].*;
                 c.server_iv = iv_material[nonce_len .. 2 * nonce_len].* ++ [1]u8{0} ** 8;
-                // TODO: lower part of `client_iv` MAY also be randomized
+                // RFC 9325, Section 7.2.1
+                // Add some entropy to the explicit IV as well
+                var explicit_iv_mask: [8]u8 = undefined;
+                crypto.random.bytes(&explicit_iv_mask);
+                c.client_iv[nonce_len..].* = explicit_iv_mask;
             },
             .CHACHA20_POLY1305_SHA256 => {
                 // TODO
@@ -554,8 +553,8 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         client.partial_ciphertext_end = @intCast(rest.len);
         @memcpy(client.partially_read_buffer[0..rest.len], rest);
         var handshake: [16]u8 = undefined;
-        _ = try client.read(stream, &handshake);
-        var ptd = tls.Decoder.fromTheirSlice(&handshake);
+        const total = try client.readAll(stream, &handshake);
+        var ptd = tls.Decoder.fromTheirSlice(handshake[0..total]);
         try ptd.ensure(4);
         const handshake_type = ptd.decode(HandshakeType);
         if (handshake_type != .finished) return error.TlsUnexpectedMessage;
@@ -566,7 +565,6 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         const verify_data = switch (hash) {
             inline else => |*h| PRF(crypto.auth.hmac.Hmac(@TypeOf(h.*)), &master_secret, "server finished", &h.finalResult(), 12),
         };
-        std.debug.print("{} {}", .{ std.fmt.fmtSliceHexLower(&verify_data), std.fmt.fmtSliceHexLower(server_verify) });
         if (!mem.eql(u8, server_verify, &verify_data))
             return error.TlsHandshakeFailure;
     }
@@ -845,12 +843,12 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     c.partial_ciphertext_end -= c.partial_ciphertext_idx;
     c.partial_ciphertext_idx = 0;
     c.partial_cleartext_idx = 0;
-    const first_iov = c.partially_read_buffer[c.partial_ciphertext_end..];
+    const remaining_partial_buffer = c.partially_read_buffer[c.partial_ciphertext_end..];
 
     var ask_iovecs_buf: [2]std.os.iovec = .{
         .{
-            .iov_base = first_iov.ptr,
-            .iov_len = first_iov.len,
+            .iov_base = remaining_partial_buffer.ptr,
+            .iov_len = remaining_partial_buffer.len,
         },
         .{
             .iov_base = &in_stack_buffer,
@@ -866,9 +864,8 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
 
     var actual_read_len: usize = 0;
     readv: {
-        // If there is already a complete record, then skip `readv`
-        // This may happen in first call to `readvAdvanced`,
-        // because c.partially_read_buffer is copied from the decoder.
+        // Skip `stream.readv` if there is a complete record unprocessed
+        // This may happen when different types of traffic are mixed.
         if (c.partial_ciphertext_end > 0) {
             const record_len = mem.readInt(u16, c.partially_read_buffer[3..5], .big);
             if (record_len + 5 <= c.partial_ciphertext_end)
@@ -891,13 +888,14 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     // but at least frag0 will have one complete ciphertext record.
     const frag0_end = @min(c.partially_read_buffer.len, c.partial_ciphertext_end + actual_read_len);
     const frag0 = c.partially_read_buffer[c.partial_ciphertext_idx..frag0_end];
-    var frag1 = in_stack_buffer[0..actual_read_len -| first_iov.len];
+    var frag1 = in_stack_buffer[0..actual_read_len -| remaining_partial_buffer.len];
     // We need to decipher frag0 and frag1 but there may be a ciphertext record
     // straddling the boundary. We can handle this with two memcpy() calls to
     // assemble the straddling record in between handling the two sides.
     var frag = frag0;
     var in: usize = 0;
     while (true) {
+        // Ensure `frag` has something unread.
         if (in == frag.len) {
             // Perfect split.
             if (frag.ptr == frag1.ptr) {
@@ -909,26 +907,23 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             continue;
         }
 
+        // Ensure a complete record header is in `frag` or finish.
         if (in + tls.record_header_len > frag.len) {
-            if (frag.ptr == frag1.ptr)
-                return finishRead(c, frag, in, vp.total);
+            if (finishRead(c, 0, frag, frag1, in)) return vp.total;
 
-            const first = frag[in..];
-
-            if (frag1.len < tls.record_header_len)
-                return finishRead2(c, first, frag1, vp.total);
-
-            // A record straddles the two fragments. Copy into the now-empty first fragment.
+            // A record header straddles the two fragments. Copy into the now-empty first fragment.
             const record_len_byte_0: u16 = straddleByte(frag, frag1, in + 3);
             const record_len_byte_1: u16 = straddleByte(frag, frag1, in + 4);
             const record_len = (record_len_byte_0 << 8) | record_len_byte_1;
             if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
 
             const full_record_len = record_len + tls.record_header_len;
+            const first = frag[in..];
             const second_len = full_record_len - first.len;
-            if (frag1.len < second_len)
-                return finishRead2(c, first, frag1, vp.total);
-
+            if (frag1.len < second_len) {
+                finishRead2(c, first, frag1);
+                return vp.total;
+            }
             limitedOverlapCopy(frag, in);
             @memcpy(frag[first.len..][0..second_len], frag1[0..second_len]);
             frag = frag[0..full_record_len];
@@ -936,35 +931,32 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             in = 0;
             continue;
         }
+
+        // Ensure a complete record is in `frag`
         const ct: tls.ContentType = @enumFromInt(frag[in]);
-        in += 1;
-        const legacy_version = mem.readInt(u16, frag[in..][0..2], .big);
-        in += 2;
-        const record_len = mem.readInt(u16, frag[in..][0..2], .big);
+        const legacy_version = mem.readInt(u16, frag[in..][1..3], .big);
+        const record_len = mem.readInt(u16, frag[in..][3..5], .big);
         if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
-        in += 2;
+        in += 5;
         const end = in + record_len;
         if (end > frag.len) {
             // We need the record header on the next iteration of the loop.
-            in -= tls.record_header_len;
+            in -= 5;
 
-            if (frag.ptr == frag1.ptr)
-                return finishRead(c, frag, in, vp.total);
+            if (finishRead(c, record_len, frag, frag1, in)) return vp.total;
 
-            // A record straddles the two fragments. Copy into the now-empty first fragment.
-            const first = frag[in..];
             const full_record_len = record_len + tls.record_header_len;
-            const second_len = full_record_len - first.len;
-            if (frag1.len < second_len)
-                return finishRead2(c, first, frag1, vp.total);
-
+            const first_len = frag.len - in;
+            const second_len = full_record_len - first_len;
             limitedOverlapCopy(frag, in);
-            @memcpy(frag[first.len..][0..second_len], frag1[0..second_len]);
+            @memcpy(frag[first_len..][0..second_len], frag1[0..second_len]);
             frag = frag[0..full_record_len];
             frag1 = frag1[second_len..];
             in = 0;
             continue;
         }
+
+        // Now decode a complete record
         switch (ct) {
             .alert => {
                 if (in + 2 > frag.len) return error.TlsDecodeError;
@@ -1045,9 +1037,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                     vp.next(cleartext.len);
                 }
             },
-            else => {
-                return error.TlsUnexpectedMessage;
-            },
+            else => return error.TlsUnexpectedMessage,
         }
         in = end;
     }
@@ -1087,7 +1077,28 @@ fn decrypt(c: *Client, ciphertext: []const u8, cleartext: []u8, content_type: tl
     }
 }
 
-fn finishRead(c: *Client, frag: []const u8, in: usize, out: usize) usize {
+/// Finish reading by copying data from `frag` and `frag1` to `c.partilly_read_buffer`
+/// Return whether `finishReadX` is called
+/// If `record_len` is not know, it can be set to zero to only check for the header.
+fn finishRead(c: *Client, record_len: usize, frag: []const u8, frag1: []const u8, index: usize) bool {
+    if (frag.ptr == frag1.ptr) {
+        finishRead1(c, frag, index);
+        return true;
+    }
+
+    // A record straddles the two fragments. Copy into the now-empty first fragment.
+    const first = frag[index..];
+    const full_record_len = record_len + tls.record_header_len;
+    const second_len = full_record_len - first.len;
+    if (frag1.len < second_len) {
+        finishRead2(c, first, frag1);
+        return true;
+    }
+    return false;
+}
+
+/// Finish reading the in-stack buffer after reading all ciphtext from `c.partially_read_buffer`
+fn finishRead1(c: *Client, frag: []const u8, in: usize) void {
     const saved_buf = frag[in..];
     if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
         // There is cleartext at the beginning already which we need to preserve.
@@ -1099,28 +1110,28 @@ fn finishRead(c: *Client, frag: []const u8, in: usize, out: usize) usize {
         c.partial_ciphertext_end = @intCast(saved_buf.len);
         @memcpy(c.partially_read_buffer[0..saved_buf.len], saved_buf);
     }
-    return out;
 }
 
+/// Finish reading both the in-stack buffer and `c.partially_read_buffer`
 /// Note that `first` usually overlaps with `c.partially_read_buffer`.
-fn finishRead2(c: *Client, first: []const u8, frag1: []const u8, out: usize) usize {
+fn finishRead2(c: *Client, first: []const u8, second: []const u8) void {
     if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
         // There is cleartext at the beginning already which we need to preserve.
-        c.partial_ciphertext_end = @intCast(c.partial_ciphertext_idx + first.len + frag1.len);
+        c.partial_ciphertext_end = @intCast(c.partial_ciphertext_idx + first.len + second.len);
         // TODO: eliminate this call to copyForwards
         std.mem.copyForwards(u8, c.partially_read_buffer[c.partial_ciphertext_idx..][0..first.len], first);
-        @memcpy(c.partially_read_buffer[c.partial_ciphertext_idx + first.len ..][0..frag1.len], frag1);
+        @memcpy(c.partially_read_buffer[c.partial_ciphertext_idx + first.len ..][0..second.len], second);
     } else {
         c.partial_cleartext_idx = 0;
         c.partial_ciphertext_idx = 0;
-        c.partial_ciphertext_end = @intCast(first.len + frag1.len);
+        c.partial_ciphertext_end = @intCast(first.len + second.len);
         // TODO: eliminate this call to copyForwards
         std.mem.copyForwards(u8, c.partially_read_buffer[0..first.len], first);
-        @memcpy(c.partially_read_buffer[first.len..][0..frag1.len], frag1);
+        @memcpy(c.partially_read_buffer[first.len..][0..second.len], second);
     }
-    return out;
 }
 
+/// Move `frag[in..]` to the beggining of `frag`
 fn limitedOverlapCopy(frag: []u8, in: usize) void {
     const first = frag[in..];
     if (first.len <= in) {
@@ -1389,7 +1400,6 @@ pub fn ApplicationCipherT(comptime AeadType: type, comptime HashType: type, comp
         pub const AEAD = AeadType;
         pub const Hash = HashType;
         pub const Hmac = crypto.auth.hmac.Hmac(Hash);
-        pub const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
         pub const explicit_nonce_len = explicit_nonce;
 
         client_key: [AEAD.key_length]u8,

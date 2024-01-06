@@ -42,7 +42,13 @@ application_cipher: ApplicationCipher,
 /// 3. unused
 /// The fields `partial_cleartext_idx`, `partial_ciphertext_idx`, and
 /// `partial_ciphertext_end` describe the span of the segments.
+/// .. |partial_cleartext_index| .. ciphertext .. |partial_ciphertext_idx| .. ciphertext .. |partial_ciphertext_end| ..
 partially_read_buffer: [tls.max_ciphertext_record_len]u8,
+
+// Actually, outside of `readvAdvaced` body, the `partially_read_buffer` may:
+// 1. Contain only ciphertext, partial_cleartext_idx == partial_ciphertext_idx == 0
+// 2. Contain only cleartext, partial_ciphertext_idx == partial_ciphertext_end
+// 3. Contain both, partial_cleartext_idx < partial_ciphertext_idx < partial_ciphertext_end
 
 /// `std.net.Stream` conforms to `std.crypto.tls.Client.StreamInterface`
 pub const StreamInterface = std.crypto.tls.Client.StreamInterface;
@@ -158,79 +164,78 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                 // TODO: handle server-side closures
                 return error.TlsUnexpectedMessage;
             },
-            .handshake => {
-                try record_decoder.ensure(4);
-                const handshake_type = record_decoder.decode(tls.HandshakeType);
-                if (handshake_type != .server_hello) return error.TlsUnexpectedMessage;
-                const length = record_decoder.decode(u24);
-                var hsd = try record_decoder.sub(length);
-                try hsd.ensure(2 + 32);
-                const legacy_version = hsd.decode(u16);
-                server_random = hsd.array(32).*;
-                if (mem.eql(u8, &server_random, &tls.hello_retry_request_sequence)) {
-                    // This is a HelloRetryRequest message. This client implementation
-                    // does not expect to get one.
-                    return error.TlsUnexpectedMessage;
-                }
-                try hsd.ensure(1);
-                const legacy_session_id_echo_len = hsd.decode(u8);
-                try hsd.ensure(legacy_session_id_echo_len);
-                const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
-                try hsd.ensure(2 + 1);
-                cipher_suite_tag = hsd.decode(CipherSuite);
-                const hash_tag = messageHash(getAEAD(cipher_suite_tag));
-                hash = switch (hash_tag) {
-                    .sha256 => MessageHashType{ .sha256 = crypto.hash.sha2.Sha256.init(.{}) },
-                    .sha384 => MessageHashType{ .sha384 = crypto.hash.sha2.Sha384.init(.{}) },
-                };
-                cipher = switch (getAEAD(cipher_suite_tag)) {
-                    inline .AES_128_GCM_SHA256,
-                    .AES_256_GCM_SHA384,
-                    .CHACHA20_POLY1305_SHA256,
-                    => |tag| createApplicationCipher(tag),
-                    else => unreachable,
-                };
-                switch (hash) {
-                    inline else => |*h| {
-                        h.update(client_hello_bytes1);
-                        h.update(host);
-                        h.update(server_hello_fragment);
-                    },
-                }
-                hsd.skip(1); // legacy_compression_method
-                var extensions_size: u16 = 0;
-                if (!hsd.eof()) {
-                    try hsd.ensure(2);
-                    extensions_size = hsd.decode(u16);
-                }
-                var all_extd = try hsd.sub(extensions_size);
-                var supported_version: u16 = 0;
-                const have_shared_key = false;
-                while (!all_extd.eof()) {
-                    try all_extd.ensure(2 + 2);
-                    const et = all_extd.decode(tls.ExtensionType);
-                    const ext_size = all_extd.decode(u16);
-                    var extd = try all_extd.sub(ext_size);
-                    switch (et) {
-                        .supported_versions => {
-                            if (supported_version != 0) return error.TlsIllegalParameter;
-                            try extd.ensure(2);
-                            supported_version = extd.decode(u16);
-                        },
-                        else => {},
-                    }
-                }
-
-                const tls_version = if (supported_version == 0) legacy_version else supported_version;
-                if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_3)) {
-                    if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id) or !have_shared_key)
-                        return error.TlsIllegalParameter;
-                } else if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_2)) {
-                    // try tls12.init(&stream, ca_bundle, host, @as(tls12.CipherSuite, @enumFromInt(@intFromEnum(cipher_suite_tag))), &d, &ptd, x25519_kp, secp256r1_kp, hello_rand, server_random);
-                } else return error.TlsAlertProtocolVersion;
-            },
+            .handshake => {},
             else => return error.TlsUnexpectedMessage,
         }
+        try record_decoder.ensure(4);
+        const handshake_type = record_decoder.decode(tls.HandshakeType);
+        if (handshake_type != .server_hello) return error.TlsUnexpectedMessage;
+        const length = record_decoder.decode(u24);
+        var hsd = try record_decoder.sub(length);
+        try hsd.ensure(2 + 32);
+        const legacy_version = hsd.decode(u16);
+        server_random = hsd.array(32).*;
+        if (mem.eql(u8, &server_random, &tls.hello_retry_request_sequence)) {
+            // This is a HelloRetryRequest message. This client implementation
+            // does not expect to get one.
+            return error.TlsUnexpectedMessage;
+        }
+        try hsd.ensure(1);
+        const legacy_session_id_echo_len = hsd.decode(u8);
+        try hsd.ensure(legacy_session_id_echo_len);
+        const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
+        try hsd.ensure(2 + 1);
+        cipher_suite_tag = hsd.decode(CipherSuite);
+        const hash_tag = messageHash(getAEAD(cipher_suite_tag));
+        hash = switch (hash_tag) {
+            .sha256 => MessageHashType{ .sha256 = crypto.hash.sha2.Sha256.init(.{}) },
+            .sha384 => MessageHashType{ .sha384 = crypto.hash.sha2.Sha384.init(.{}) },
+        };
+        cipher = switch (getAEAD(cipher_suite_tag)) {
+            inline .AES_128_GCM_SHA256,
+            .AES_256_GCM_SHA384,
+            .CHACHA20_POLY1305_SHA256,
+            => |tag| createApplicationCipher(tag),
+            else => unreachable,
+        };
+        switch (hash) {
+            inline else => |*h| {
+                h.update(client_hello_bytes1);
+                h.update(host);
+                h.update(server_hello_fragment);
+            },
+        }
+        hsd.skip(1); // legacy_compression_method
+        var extensions_size: u16 = 0;
+        if (!hsd.eof()) {
+            try hsd.ensure(2);
+            extensions_size = hsd.decode(u16);
+        }
+        var all_extd = try hsd.sub(extensions_size);
+        var supported_version: u16 = 0;
+        const have_shared_key = false;
+        while (!all_extd.eof()) {
+            try all_extd.ensure(2 + 2);
+            const et = all_extd.decode(tls.ExtensionType);
+            const ext_size = all_extd.decode(u16);
+            var extd = try all_extd.sub(ext_size);
+            switch (et) {
+                .supported_versions => {
+                    if (supported_version != 0) return error.TlsIllegalParameter;
+                    try extd.ensure(2);
+                    supported_version = extd.decode(u16);
+                },
+                else => {},
+            }
+        }
+
+        const tls_version = if (supported_version == 0) legacy_version else supported_version;
+        if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_3)) {
+            if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id) or !have_shared_key)
+                return error.TlsIllegalParameter;
+        } else if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_2)) {
+            // try tls12.init(&stream, ca_bundle, host, @as(tls12.CipherSuite, @enumFromInt(@intFromEnum(cipher_suite_tag))), &d, &ptd, x25519_kp, secp256r1_kp, hello_rand, server_random);
+        } else return error.TlsAlertProtocolVersion;
     }
 
     var main_cert_pub_key_algo: Certificate.AlgorithmCategory = undefined;
@@ -443,14 +448,8 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
             tls.int3(@intCast(public_key.len + 1)) ++
             [1]u8{@intCast(public_key.len)};
         var iovecs = [_]std.os.iovec_const{
-            .{
-                .iov_base = &header,
-                .iov_len = header.len,
-            },
-            .{
-                .iov_base = public_key.ptr,
-                .iov_len = public_key.len,
-            },
+            .{ .iov_base = &header, .iov_len = header.len },
+            .{ .iov_base = public_key.ptr, .iov_len = public_key.len },
         };
         try stream.writevAll(&iovecs);
         switch (hash) {
@@ -475,8 +474,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     {
         const seed = client_random ++ server_random;
         master_secret = switch (hash) {
-            .sha384 => PRF(crypto.auth.hmac.sha2.HmacSha384, shared_key, "master secret", &seed, 48),
-            .sha256 => PRF(crypto.auth.hmac.sha2.HmacSha256, shared_key, "master secret", &seed, 48),
+            inline else => |h| PRF(crypto.auth.hmac.Hmac(@TypeOf(h)), shared_key, "master secret", &seed, 48),
         };
         // Key Expansion: note that AEAD do not need mac key
         const seed2 = server_random ++ client_random;
@@ -820,6 +818,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             return amt;
         }
     }
+    assert(c.partial_cleartext_idx == 0 and c.partial_ciphertext_idx == 0);
 
     assert(!c.received_close_notify);
 
@@ -827,7 +826,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     // too small to fit the cleartext, which may be as large as `max_ciphertext_len`.
     var cleartext_stack_buffer: [max_ciphertext_len]u8 = undefined;
     // Temporarily stores ciphertext before decrypting it and giving it to `iovecs`.
-    var in_stack_buffer: [max_ciphertext_len * 4]u8 = undefined;
+    var in_stack_buffer: [1]u8 = undefined;
     // How many bytes left in the user's buffer.
     const free_size = vp.freeSize();
     // The amount of the user's buffer that we need to repurpose for storing
@@ -836,6 +835,8 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     // The amount of the user's buffer that will be used to give cleartext. The
     // beginning of the buffer will be used for such purposes.
     const cleartext_buf_len = free_size - ciphertext_buf_len;
+    // What do all above mean? Ciphertext is never stored in user's buffer.
+    // And what does 4 ciphertext records mean?
 
     // Recoup `partially_read_buffer space`. This is necessary because it is assumed
     // below that `frag0` is big enough to hold at least one record.
@@ -845,15 +846,16 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     c.partial_cleartext_idx = 0;
     const remaining_partial_buffer = c.partially_read_buffer[c.partial_ciphertext_end..];
 
-    var ask_iovecs_buf: [2]std.os.iovec = .{
+    var ask_iovecs_buf: [1]std.os.iovec = .{
         .{
             .iov_base = remaining_partial_buffer.ptr,
             .iov_len = remaining_partial_buffer.len,
         },
-        .{
-            .iov_base = &in_stack_buffer,
-            .iov_len = in_stack_buffer.len,
-        },
+        // TODO: enable reading multiple records
+        // .{
+        //     .iov_base = &in_stack_buffer,
+        //     .iov_len = in_stack_buffer.len,
+        // },
     };
 
     // Cleartext capacity of output buffer, in records. Minimum one full record.
@@ -899,6 +901,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         if (in == frag.len) {
             // Perfect split.
             if (frag.ptr == frag1.ptr) {
+                // Buffer now contains only cleartext
                 c.partial_ciphertext_end = c.partial_ciphertext_idx;
                 return vp.total;
             }
@@ -956,7 +959,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             continue;
         }
 
-        // Now decode a complete record
+        // Now decode a complete record in `frag`
         switch (ct) {
             .alert => {
                 if (in + 2 > frag.len) return error.TlsDecodeError;
@@ -968,112 +971,76 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                 // TODO: handle server-side closures
                 return error.TlsUnexpectedMessage;
             },
-            .application_data, .handshake => {
-                const cleartext = switch (c.application_cipher) {
-                    inline else => |*p| c: {
-                        const P = @TypeOf(p.*);
-                        const V = @Vector(P.AEAD.nonce_length, u8);
-                        const ciphertext_len = record_len - P.AEAD.tag_length - P.explicit_nonce_len;
-                        const explicit_nonce = frag[in..][0..P.explicit_nonce_len].*;
-                        in += explicit_nonce.len;
-                        const ciphertext = frag[in..][0..ciphertext_len];
-                        in += ciphertext_len;
-                        const auth_tag = frag[in..][0..P.AEAD.tag_length].*;
-                        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                        const seq_big = @as([8]u8, @bitCast(big(c.read_seq)));
-                        var nonce: [P.AEAD.nonce_length]u8 = undefined;
-                        if (explicit_nonce.len != 0) {
-                            const implicit_nonce_len = P.AEAD.nonce_length - explicit_nonce.len;
-                            nonce[0..implicit_nonce_len].* = p.server_iv[0..implicit_nonce_len].*;
-                            nonce[implicit_nonce_len..P.AEAD.nonce_length].* = explicit_nonce;
-                        } else {
-                            const operand: V = pad ++ seq_big;
-                            nonce = @as(V, p.server_iv) ^ operand;
-                        }
-                        const out_buf = vp.peek();
-                        const cleartext_buf = if (ciphertext.len <= out_buf.len)
-                            out_buf
-                        else
-                            &cleartext_stack_buffer;
-                        const cleartext = cleartext_buf[0..ciphertext.len];
-                        const ad = seq_big ++
-                            [1]u8{@intFromEnum(ct)} ++
-                            int2(legacy_version) ++
-                            int2(@intCast(ciphertext_len));
-                        P.AEAD.decrypt(cleartext, ciphertext, auth_tag, &ad, nonce, p.server_key) catch
-                            return error.TlsBadRecordMac;
-                        break :c cleartext;
-                    },
-                };
-
-                c.read_seq = try std.math.add(u64, c.read_seq, 1);
-
-                // Determine whether the output buffer or a stack
-                // buffer was used for storing the cleartext.
-                if (cleartext.ptr == &cleartext_stack_buffer) {
-                    // Stack buffer was used, so we must copy to the output buffer.
-                    const msg = cleartext;
-                    if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
-                        // We have already run out of room in iovecs. Continue
-                        // appending to `partially_read_buffer`.
-                        @memcpy(
-                            c.partially_read_buffer[c.partial_ciphertext_idx..][0..msg.len],
-                            msg,
-                        );
-                        c.partial_ciphertext_idx = @intCast(c.partial_ciphertext_idx + msg.len);
-                    } else {
-                        const amt = vp.put(msg);
-                        if (amt < msg.len) {
-                            const rest = msg[amt..];
-                            c.partial_cleartext_idx = 0;
-                            c.partial_ciphertext_idx = @intCast(rest.len);
-                            @memcpy(c.partially_read_buffer[0..rest.len], rest);
-                        }
-                    }
-                } else {
-                    // Output buffer was used directly which means no
-                    // memory copying needs to occur, and we can move
-                    // on to the next ciphertext record.
-                    vp.next(cleartext.len);
-                }
-            },
+            .application_data, .handshake => {},
             else => return error.TlsUnexpectedMessage,
         }
-        in = end;
-    }
-}
+        const cleartext = switch (c.application_cipher) {
+            inline else => |*p| c: {
+                const P = @TypeOf(p.*);
+                const V = @Vector(P.AEAD.nonce_length, u8);
+                const ciphertext_len = record_len - P.AEAD.tag_length - P.explicit_nonce_len;
+                const explicit_nonce = frag[in..][0..P.explicit_nonce_len].*;
+                in += explicit_nonce.len;
+                const ciphertext = frag[in..][0..ciphertext_len];
+                in += ciphertext_len;
+                const auth_tag = frag[in..][0..P.AEAD.tag_length].*;
+                const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                const seq_big = @as([8]u8, @bitCast(big(c.read_seq)));
+                var nonce: [P.AEAD.nonce_length]u8 = undefined;
+                if (explicit_nonce.len != 0) {
+                    const implicit_nonce_len = P.AEAD.nonce_length - explicit_nonce.len;
+                    nonce[0..implicit_nonce_len].* = p.server_iv[0..implicit_nonce_len].*;
+                    nonce[implicit_nonce_len..P.AEAD.nonce_length].* = explicit_nonce;
+                } else {
+                    const operand: V = pad ++ seq_big;
+                    nonce = @as(V, p.server_iv) ^ operand;
+                }
+                const out_buf = vp.peek();
+                const cleartext_buf = if (ciphertext.len <= out_buf.len)
+                    out_buf
+                else
+                    &cleartext_stack_buffer;
+                const cleartext = cleartext_buf[0..ciphertext.len];
+                const ad = seq_big ++
+                    [1]u8{@intFromEnum(ct)} ++
+                    int2(legacy_version) ++
+                    int2(@intCast(ciphertext_len));
+                P.AEAD.decrypt(cleartext, ciphertext, auth_tag, &ad, nonce, p.server_key) catch
+                    return error.TlsBadRecordMac;
+                break :c cleartext;
+            },
+        };
 
-// Decrypt body of a TLSCiphertext record
-// `ciphertext`: explicit_nonce + payload + authentication_tag
-// `cleartext`: output buffer, size must be payload.len.
-fn decrypt(c: *Client, ciphertext: []const u8, cleartext: []u8, content_type: tls.ContentType) !void {
-    switch (c.application_cipher) {
-        inline else => |*p| {
-            const P = @TypeOf(p.*);
-            const V = @Vector(P.AEAD.nonce_length, u8);
-            assert(ciphertext.len == cleartext.len + P.explicit_nonce_len + P.AEAD.tag_length);
+        c.read_seq = try std.math.add(u64, c.read_seq, 1);
 
-            // const ad = ciphertext[0..5];
-            const ciphertext_len = cleartext.len - P.AEAD.tag_length - P.explicit_nonce_len;
-            const explicit_nonce = ciphertext[0..P.explicit_nonce_len].*;
-            var begin = explicit_nonce.len;
-            const payload = ciphertext[begin..][0..ciphertext_len];
-            begin += ciphertext_len;
-            const auth_tag = ciphertext[begin..][0..P.AEAD.tag_length].*;
-            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-            const seq_big = @as([8]u8, @bitCast(big(c.read_seq)));
-            const operand: V = pad ++ seq_big;
-            var nonce: [P.AEAD.nonce_length]u8 = @as(V, p.server_iv) ^ operand;
-            if (explicit_nonce.len != 0) {
-                nonce[P.AEAD.nonce_length - explicit_nonce.len .. P.AEAD.nonce_length].* = explicit_nonce;
+        // Determine whether the output buffer or a stack
+        // buffer was used for storing the cleartext.
+        if (cleartext.ptr == &cleartext_stack_buffer) {
+            // Stack buffer was used, so we must copy to the output buffer.
+            if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
+                // We have already run out of room in iovecs. Continue
+                // appending to `partially_read_buffer`.
+                @memcpy(
+                    c.partially_read_buffer[c.partial_ciphertext_idx..][0..cleartext.len],
+                    cleartext,
+                );
+                c.partial_ciphertext_idx = @intCast(c.partial_ciphertext_idx + cleartext.len);
+            } else {
+                const amt = vp.put(cleartext);
+                if (amt < cleartext.len) {
+                    const rest = cleartext[amt..];
+                    c.partial_cleartext_idx = 0;
+                    c.partial_ciphertext_idx = @intCast(rest.len);
+                    @memcpy(c.partially_read_buffer[0..rest.len], rest);
+                }
             }
-            const ad = seq_big ++
-                [1]u8{@intFromEnum(content_type)} ++
-                int2(@intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                int2(@intCast(cleartext.len));
-            P.AEAD.decrypt(cleartext, payload, auth_tag, ad, nonce, p.server_key) catch
-                return error.TlsBadRecordMac;
-        },
+        } else {
+            // Output buffer was used directly which means no
+            // memory copying needs to occur, and we can move
+            // on to the next ciphertext record.
+            vp.next(cleartext.len);
+        }
+        in = end;
     }
 }
 
@@ -1372,25 +1339,6 @@ pub fn messageHash(cs: tls.CipherSuite) HashName {
         .AES_128_GCM_SHA256 => .sha256,
         .AES_256_GCM_SHA384 => .sha384,
         .CHACHA20_POLY1305_SHA256 => .sha256,
-        else => unreachable,
-    };
-}
-
-// AEAD do not need a separate mac key
-pub fn keyLength(aead: tls.CipherSuite) usize {
-    return switch (aead) {
-        .AES_128_GCM_SHA256 => 16,
-        .AES_256_GCM_SHA384 => 32,
-        .CHACHA20_POLY1305_SHA256 => 32,
-        else => unreachable,
-    };
-}
-
-pub fn nonceLength(aead: tls.CipherSuite) usize {
-    return switch (aead) {
-        .AES_128_GCM_SHA256 => 4, // with 8 byte explicit nonce
-        .AES_256_GCM_SHA384 => 4, // with 8 byte explicit nonce
-        .CHACHA20_POLY1305_SHA256 => 12,
         else => unreachable,
     };
 }

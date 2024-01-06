@@ -25,9 +25,9 @@ test "connect https" {
 
         try req.send(.{ .raw_uri = true });
         try req.wait();
-        const body = try req.reader().readAllAlloc(allocator, 1024 * 32);
+        const body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
         defer allocator.free(body);
 
-        std.debug.print("{s}", .{body});
+        std.debug.print("\n{s}: {s}", .{ line, std.fmt.fmtSliceEscapeLower(body[0..128]) });
     }
 }

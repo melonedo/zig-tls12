@@ -157,9 +157,10 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     const client_hello_bytes1 = plaintext_header[5..];
     var server_random: [32]u8 = undefined;
 
-    var handshake_buffer: [8000]u8 = undefined;
-    var d: tls.Decoder = .{ .buf = &handshake_buffer };
+    // In theory the certificate could be as long as 16MB though.
+    var handshake_buffer: [16000]u8 = undefined;
     var cipher_suite_tag: CipherSuite = undefined;
+    var d: tls.Decoder = .{ .buf = &handshake_buffer };
     {
         try d.readAtLeastOurAmt(client_stream, 4);
         const handshake_type = d.decode(tls.HandshakeType);
@@ -496,9 +497,17 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     // Client Finished
     {
         const verify_data = switch (hash) {
-            inline else => |*h| PRF(crypto.auth.hmac.Hmac(@TypeOf(h.*)), &master_secret, "client finished", &h.peek(), 12),
+            inline else => |*h| PRF(
+                crypto.auth.hmac.Hmac(@TypeOf(h.*)),
+                &master_secret,
+                "client finished",
+                &h.peek(),
+                12,
+            ),
         };
-        const handshake_finished: [16]u8 = [1]u8{@intFromEnum(HandshakeType.finished)} ++ int3(12) ++ verify_data;
+        const handshake_finished: [16]u8 =
+            [1]u8{@intFromEnum(HandshakeType.finished)} ++
+            int3(12) ++ verify_data;
         const total = try c.writeEnd(stream, &handshake_finished, false, .handshake);
         assert(total == 16);
         switch (hash) {
@@ -823,11 +832,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                 .iov_base = remaining_partial_buffer.ptr,
                 .iov_len = remaining_partial_buffer.len,
             },
-            // TODO: enable reading multiple records
-            // .{
-            //     .iov_base = &in_stack_buffer,
-            //     .iov_len = in_stack_buffer.len,
-            // },
+            // TODO: enable larger buffer
         };
 
         const received_len = try stream.readv(&ask_iovecs_buf);
@@ -846,23 +851,10 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         }
     }
 
-    // Decrypt
-    while (true) {
+    // Decrypt. Note that we return as soon as we see one complete record.
+    decrypt: {
         var in: usize = 0;
         const frag = c.ciphertext_slice;
-        // Ensure `frag` has something unread.
-        if (in == frag.len) {
-            // Perfect split.
-            // Buffer now contains only cleartext
-            c.ciphertext_slice = c.partially_read_buffer[0..0];
-            return vp.total;
-        }
-
-        // Ensure a complete record header is in `frag` or finish.
-        if (in + tls.record_header_len > frag.len) {
-            c.ciphertext_slice = c.ciphertext_slice[in..];
-            return vp.total;
-        }
 
         // Ensure a complete record is in `frag`
         const ct: tls.ContentType = @enumFromInt(frag[in]);
@@ -871,13 +863,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
         in += 5;
         const end = in + record_len;
-        if (end > frag.len) {
-            // We need the record header on the next iteration of the loop.
-            in -= 5;
-
-            c.ciphertext_slice = c.ciphertext_slice[in..];
-            return vp.total;
-        }
+        assert(end <= frag.len);
 
         // Now decode a complete record in `frag`
         switch (ct) {
@@ -888,8 +874,9 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                 _ = level;
 
                 try desc.toError();
-                // TODO: handle server-side closures
-                return error.TlsUnexpectedMessage;
+                assert(desc == tls.AlertDescription.close_notify);
+                c.ciphertext_slice = c.ciphertext_slice[end..];
+                break :decrypt;
             },
             // TODO: distinguish between these
             .application_data, .handshake, .change_cipher_spec => {},
@@ -941,8 +928,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                 c.cleartext_slice = cleartext[amt..];
             }
             c.ciphertext_slice = c.ciphertext_slice[end..];
-            // I do not want to decode too much here
-            return vp.total;
+            break :decrypt;
         };
 
         c.read_seq = try std.math.add(u64, c.read_seq, 1);
@@ -980,6 +966,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         }
         c.ciphertext_slice = c.ciphertext_slice[end..];
     }
+    return vp.total;
 }
 
 /// Move `frag[in..]` to the beginning of `frag`

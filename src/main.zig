@@ -7,6 +7,7 @@ test "connect https" {
     const allocator = testing.allocator;
     var client = HttpClient{ .allocator = allocator };
     defer client.deinit();
+    try client.loadDefaultProxies();
 
     var file = try std.fs.cwd().openFile("urls.txt", .{});
     defer file.close();
@@ -20,12 +21,20 @@ test "connect https" {
         var headers = http.Headers{ .allocator = allocator };
         defer headers.deinit();
 
-        var req = try client.open(.GET, uri, headers, .{});
+        var req = client.open(
+            .GET,
+            uri,
+            headers,
+            .{ .max_redirects = 10 },
+        ) catch {
+            std.debug.print("\nFailed: {s}\n", .{line});
+            continue;
+        };
         defer req.deinit();
 
         try req.send(.{ .raw_uri = true });
         try req.wait();
-        const body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
+        const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
         defer allocator.free(body);
 
         std.debug.print("\n{s}: {s}", .{ line, std.fmt.fmtSliceEscapeLower(body[0..128]) });

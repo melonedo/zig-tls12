@@ -65,13 +65,23 @@ pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8, legac
         0x02, // byte length of supported versions
         0x03, 0x03, // TLS 1.2
     }) ++ tls.extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
+        .ecdsa_secp256r1_sha256,
+        .ecdsa_secp384r1_sha384,
         .rsa_pkcs1_sha256,
         .rsa_pkcs1_sha384,
         .rsa_pkcs1_sha512,
     })) ++ tls.extension(.supported_groups, enum_array(tls.NamedGroup, &.{
+        // TODO: .secp384r1,
         .secp256r1,
         .x25519,
-    })) ++
+    })) ++ tls.extension(ec_point_formats, [2]u8{
+        1, // number of formats
+        @intFromEnum(ECPointFormat.uncompressed),
+    }) ++
+        // TODO: tls.extension(extended_master_secret, [0]u8{}) ++
+        tls.extension(renegotiation_info, [1]u8{
+        0, // no renegotiation data
+    }) ++
         int2(@intFromEnum(tls.ExtensionType.server_name)) ++
         int2(host_len + 5) ++ // byte length of this extension payload
         int2(host_len + 3) ++ // server_name_list byte count
@@ -299,9 +309,13 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     }
 
     // Server Key Exchange Message
+    var shared_key_buf: [48]u8 = undefined;
     var shared_key: []const u8 = undefined;
     var named_group: tls.NamedGroup = undefined;
-    {
+    const kea = getKeyExchangeAlgorithm(cipher_suite_tag);
+    if (kea == .RSA) {
+        shared_key = &shared_key_buf;
+    } else {
         try d.readAtLeastOurAmt(client_stream, 4);
         try d.ensure(4);
         const handshake_type = d.decode(HandshakeType);
@@ -314,10 +328,10 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         }
         var hsd = try d.sub(length);
 
-        const is_ecc = is_ecdhe(cipher_suite_tag);
-        // TODO: implement DHE
-        assert(is_ecc);
-
+        switch (kea) {
+            .ECDHE => {},
+            .RSA, .DHE => unreachable,
+        }
         try hsd.ensure(4);
         const curve_type = hsd.decode(ECCurveType);
         if (curve_type != .named_curve) return error.TlsIllegalParameter;
@@ -415,25 +429,51 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
 
     // Client Key Exchange
     {
-        const public_key: []const u8 = switch (named_group) {
-            .x25519 => &x25519_kp.public_key,
-            .secp256r1 => &secp256r1_kp.public_key.toUncompressedSec1(),
-            else => unreachable,
+        var public_key_buf: [512]u8 = undefined;
+        const public_key: []const u8 = switch (kea) {
+            .ECDHE => switch (named_group) {
+                .x25519 => &x25519_kp.public_key,
+                .secp256r1 => &secp256r1_kp.public_key.toUncompressedSec1(),
+                else => unreachable,
+            },
+            .RSA => rsa: {
+                // 0x0303 for TLS 1.2
+                shared_key_buf[0] = 0x03;
+                shared_key_buf[1] = 0x03;
+                crypto.random.bytes(shared_key_buf[2..]);
+                break :rsa try Certificate.encryptPKCS1(&public_key_buf, &shared_key_buf, &main_cert_pub_key_buf);
+            },
+            .DHE => unreachable,
         };
-        const header = [1]u8{@intFromEnum(tls.ContentType.handshake)} ++
+        var record_header = [1]u8{@intFromEnum(tls.ContentType.handshake)} ++
             tls.int2(@intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-            tls.int2(@intCast(public_key.len + 5)) ++
-            [1]u8{@intFromEnum(HandshakeType.client_key_exchange)} ++
-            tls.int3(@intCast(public_key.len + 1)) ++
-            [1]u8{@intCast(public_key.len)};
+            [2]u8{ undefined, undefined };
+        var header_buffer: [6]u8 = undefined;
+        header_buffer[0] = @intFromEnum(HandshakeType.client_key_exchange);
+        const header = switch (kea) {
+            .ECDHE => blk: {
+                record_header[3..5].* = int2(@intCast(public_key.len + 5));
+                header_buffer[1..4].* = int3(@intCast(public_key.len + 1));
+                header_buffer[4] = @intCast(public_key.len);
+                break :blk header_buffer[0..5];
+            },
+            .RSA => blk: {
+                record_header[3..5].* = int2(@intCast(public_key.len + 6));
+                header_buffer[1..4].* = int3(@intCast(public_key.len + 2));
+                header_buffer[4..6].* = int2(@intCast(public_key.len));
+                break :blk header_buffer[0..6];
+            },
+            .DHE => unreachable,
+        };
         var iovecs = [_]std.os.iovec_const{
-            .{ .iov_base = &header, .iov_len = header.len },
+            .{ .iov_base = &record_header, .iov_len = record_header.len },
+            .{ .iov_base = header.ptr, .iov_len = header.len },
             .{ .iov_base = public_key.ptr, .iov_len = public_key.len },
         };
         try stream.writevAll(&iovecs);
         switch (hash) {
             inline else => |*h| {
-                h.update(header[5..]);
+                h.update(header);
                 h.update(public_key);
             },
         }
@@ -995,7 +1035,6 @@ pub fn SchemeEcdsa(comptime scheme: tls.SignatureScheme) type {
     return switch (scheme) {
         .ecdsa_secp256r1_sha256 => crypto.sign.ecdsa.EcdsaP256Sha256,
         .ecdsa_secp384r1_sha384 => crypto.sign.ecdsa.EcdsaP384Sha384,
-        .ecdsa_secp521r1_sha512 => crypto.sign.ecdsa.EcdsaP512Sha512,
         else => @compileError("bad scheme"),
     };
 }
@@ -1106,13 +1145,19 @@ pub const cipher_suites = tls.enum_array(CipherSuite, &.{
     // .DHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
     // .ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
     .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+
+    // Legacy
+    .RSA_WITH_AES_128_GCM_SHA256,
+    .RSA_WITH_AES_256_GCM_SHA384,
 });
 
 pub const CipherSuite = enum(u16) {
     // TLS 1.2 cipher suites equivalent to ones supported by TLS 1.3
-    // Key exchange: DHE/ECDHE
+    // Key exchange: DHE/ECDHE/RSA(only with AES-GCM)
     // Authentication: RSA/PSK/ECDSA(only with ECDHE)
     // AEAD: AES_128_GCM_SHA256/AES_256_GCM_SHA384/CHACHA20_POLY1305_SHA256
+    RSA_WITH_AES_128_GCM_SHA256 = 0x009c,
+    RSA_WITH_AES_256_GCM_SHA384 = 0x009d,
     DHE_RSA_WITH_AES_128_GCM_SHA256 = 0x009e,
     DHE_RSA_WITH_AES_256_GCM_SHA384 = 0x009f,
     DHE_PSK_WITH_AES_128_GCM_SHA256 = 0x00aa,
@@ -1156,6 +1201,10 @@ pub const ECCurveType = enum(u8) {
     _,
 };
 
+pub const ec_point_formats: tls.ExtensionType = @enumFromInt(0xb);
+pub const extended_master_secret: tls.ExtensionType = @enumFromInt(0x17);
+pub const renegotiation_info: tls.ExtensionType = @enumFromInt(0xff01);
+
 pub const ECPointFormat = enum(u8) {
     uncompressed = 0,
     ansiX962_compressed_prime = 1, // deprecated by RFC 8422
@@ -1170,17 +1219,19 @@ pub fn getAEAD(cs: CipherSuite) tls.CipherSuite {
         .DHE_PSK_WITH_AES_128_GCM_SHA256 => .AES_128_GCM_SHA256,
         .ECDHE_PSK_WITH_AES_128_GCM_SHA256 => .AES_128_GCM_SHA256,
         .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => .AES_128_GCM_SHA256,
+        .RSA_WITH_AES_128_GCM_SHA256 => .AES_128_GCM_SHA256,
         .DHE_RSA_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
         .DHE_PSK_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
         .ECDHE_PSK_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
         .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
+        .RSA_WITH_AES_256_GCM_SHA384 => .AES_256_GCM_SHA384,
         .DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
         .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
         .DHE_PSK_WITH_CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
         .ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
         .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => .CHACHA20_POLY1305_SHA256,
-        else => unreachable,
+        _ => unreachable,
     };
 }
 
@@ -1224,7 +1275,9 @@ pub fn createApplicationCipher(comptime tag: tls.CipherSuite) ApplicationCipher 
     });
 }
 
-fn is_ecdhe(cs: CipherSuite) bool {
+pub const KeyExchangeAlgorithm = enum { ECDHE, DHE, RSA };
+
+pub fn getKeyExchangeAlgorithm(cs: CipherSuite) KeyExchangeAlgorithm {
     return switch (cs) {
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_PSK_WITH_AES_128_GCM_SHA256,
@@ -1235,14 +1288,17 @@ fn is_ecdhe(cs: CipherSuite) bool {
         .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         .ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
         .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        => true,
+        => .ECDHE,
         .DHE_RSA_WITH_AES_128_GCM_SHA256,
         .DHE_PSK_WITH_AES_128_GCM_SHA256,
         .DHE_RSA_WITH_AES_256_GCM_SHA384,
         .DHE_PSK_WITH_AES_256_GCM_SHA384,
         .DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         .DHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
-        => false,
+        => .DHE,
+        .RSA_WITH_AES_128_GCM_SHA256,
+        .RSA_WITH_AES_256_GCM_SHA384,
+        => .RSA,
         _ => unreachable,
     };
 }

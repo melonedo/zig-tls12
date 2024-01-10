@@ -757,7 +757,7 @@ pub fn verifyRsa(
     Hash.hash(message, &msg_hashed, .{});
 
     switch (modulus.len) {
-        inline 128, 256, 512 => |modulus_len| {
+        inline 128, 256, 384, 512 => |modulus_len| {
             const ps_len = modulus_len - (hash_der.len + msg_hashed.len) - 3;
             const em: [modulus_len]u8 =
                 [2]u8{ 0, 1 } ++
@@ -776,6 +776,41 @@ pub fn verifyRsa(
             }
         },
         else => {
+            return error.CertificateSignatureUnsupportedBitCount;
+        },
+    }
+}
+
+pub fn encryptPKCS1(
+    out: []u8,
+    message: []u8,
+    pub_key: []const u8,
+) ![]u8 {
+    const pk_components = try rsa.PublicKey.parseDer(pub_key);
+    const exponent = pk_components.exponent;
+    const modulus = pk_components.modulus;
+    std.debug.assert(modulus.len > message.len + 11);
+
+    switch (modulus.len) {
+        inline 128, 256, 512 => |modulus_len| {
+            const ps_len = modulus_len - message.len - 3;
+            var em: [modulus_len]u8 = undefined;
+            em[0] = 0;
+            em[1] = 2;
+            const ps = em[2..][0..ps_len];
+            em[ps_len + 2] = 0;
+            @memcpy(em[modulus_len - message.len .. modulus_len], message);
+            while (true) {
+                crypto.random.bytes(ps);
+                if (std.mem.indexOfScalar(u8, ps, 0) == null) break;
+            }
+
+            const public_key = rsa.PublicKey.fromBytes(exponent, modulus) catch return error.CertificateSignatureInvalid;
+            @memcpy(out[0..modulus_len], &try rsa.encrypt(modulus_len, em, public_key));
+            return out[0..modulus_len];
+        },
+        else => {
+            std.debug.print("{}", .{modulus.len});
             return error.CertificateSignatureUnsupportedBitCount;
         },
     }

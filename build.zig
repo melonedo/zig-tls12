@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     // but does not run it.
     const main_tests = b.addTest(.{
         .name = "tests",
-        .root_source_file = .{ .path = "src/main.zig" },
+        .root_source_file = .{ .path = "src/tests.zig" },
         .target = target,
         .optimize = optimize,
     });

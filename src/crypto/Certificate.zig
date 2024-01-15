@@ -792,7 +792,7 @@ pub fn encryptPKCS1(
     std.debug.assert(modulus.len > message.len + 11);
 
     switch (modulus.len) {
-        inline 128, 256, 512 => |modulus_len| {
+        inline 128, 256, 384, 512 => |modulus_len| {
             const ps_len = modulus_len - message.len - 3;
             var em: [modulus_len]u8 = undefined;
             em[0] = 0;

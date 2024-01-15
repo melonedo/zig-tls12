@@ -15,13 +15,6 @@ const enum_array = tls.enum_array;
 
 read_seq: u64,
 write_seq: u64,
-/// The starting index of cleartext bytes inside `partially_read_buffer`.
-// partial_cleartext_idx: u15,
-/// The ending index of cleartext bytes inside `partially_read_buffer` as well
-/// as the starting index of ciphertext bytes.
-// partial_ciphertext_idx: u15,
-/// The ending index of ciphertext bytes inside `partially_read_buffer`.
-// partial_ciphertext_end: u15,
 /// When this is true, the stream may still not be at the end because there
 /// may be data in `partially_read_buffer`.
 received_close_notify: bool,
@@ -33,56 +26,46 @@ received_close_notify: bool,
 /// application layer itself verifies that the amount of data received equals
 /// the amount of data expected, such as HTTP with the Content-Length header.
 allow_truncation_attacks: bool = false,
+/// RFC 5746
+secure_renegotiation: bool = false,
 cipher: ?ApplicationCipher,
 /// The size is enough to contain exactly one TLSCiphertext record.
-/// This buffer is segmented into four parts:
-/// 0. unused
-/// 1. cleartext
-/// 2. ciphertext
-/// 3. unused
-/// The fields `partial_cleartext_idx`, `partial_ciphertext_idx`, and
-/// `partial_ciphertext_end` describe the span of the segments.
-/// .. |partial_cleartext_index| .. ciphertext .. |partial_ciphertext_idx| .. ciphertext .. |partial_ciphertext_end| ..
+/// This buffer is indexed by `cleartext_slice` and `ciphertext_slice`,
+/// where `cleartext_slice` must preceed `ciphertext_slice`.
+/// Note that this is a little bit off from `std.crypto.tls.Client`, which
+/// requires `cleartext_slice.ptr + cleartext_slice.len == ciphertext.ptr`.
 partially_read_buffer: [tls.max_ciphertext_record_len]u8,
 /// Slice into `partially_read_buffer` which is cleartext
 cleartext_slice: []u8,
 /// Slice into `partially_read_buffer` which is ciphertext
 ciphertext_slice: []u8,
 
-// Actually, outside of `readvAdvaced` body, the `partially_read_buffer` may:
-// 1. Contain only ciphertext, partial_cleartext_idx == partial_ciphertext_idx
-// 2. Contain only cleartext, partial_ciphertext_idx == partial_ciphertext_end
-// 3. Contain both, partial_cleartext_idx < partial_ciphertext_idx < partial_ciphertext_end
-
 /// `std.net.Stream` conforms to `std.crypto.tls.Client.StreamInterface`
 pub const StreamInterface = std.crypto.tls.Client.StreamInterface;
 
-pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8, legacy_session_id: [32]u8) []const u8 {
-    _ = legacy_session_id;
+pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8) []const u8 {
     const host_len: u16 = @intCast(host.len);
     const extensions_payload =
-        tls.extension(.supported_versions, [_]u8{
+        extension(.supported_versions, [_]u8{
         0x02, // byte length of supported versions
         0x03, 0x03, // TLS 1.2
-    }) ++ tls.extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
+    }) ++ extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
         .ecdsa_secp256r1_sha256,
         .ecdsa_secp384r1_sha384,
         .rsa_pkcs1_sha256,
         .rsa_pkcs1_sha384,
         .rsa_pkcs1_sha512,
-    })) ++ tls.extension(.supported_groups, enum_array(tls.NamedGroup, &.{
-        // TODO: .secp384r1,
+    })) ++ extension(.supported_groups, enum_array(tls.NamedGroup, &.{
         .secp256r1,
         .x25519,
-    })) ++ tls.extension(ec_point_formats, [2]u8{
+    })) ++ extension(.ec_point_formats, [2]u8{
         1, // number of formats
         @intFromEnum(ECPointFormat.uncompressed),
     }) ++
-        // TODO: tls.extension(extended_master_secret, [0]u8{}) ++
-        tls.extension(renegotiation_info, [1]u8{
-        0, // no renegotiation data
-    }) ++
-        int2(@intFromEnum(tls.ExtensionType.server_name)) ++
+        extension(.extended_master_secret, [0]u8{}) ++
+        // no renegotiation data
+        extension(.renegotiation_info, [1]u8{0}) ++
+        int2(@intFromEnum(ExtensionType.server_name)) ++
         int2(host_len + 5) ++ // byte length of this extension payload
         int2(host_len + 3) ++ // server_name_list byte count
         [1]u8{0x00} ++ // name_type
@@ -97,7 +80,7 @@ pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8, legac
     const client_hello =
         int2(@intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
         client_random ++
-        [1]u8{0} ++
+        [1]u8{0} ++ // session_id
         cipher_suites ++
         int2(legacy_compression_methods) ++
         extensions_header;
@@ -120,12 +103,11 @@ pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8, legac
 ///
 /// `host` is only borrowed during this function call.
 pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const u8) !Client {
-    var random_buffer: [128]u8 = undefined;
+    var random_buffer: [72]u8 = undefined;
     crypto.random.bytes(&random_buffer);
     const client_random = random_buffer[0..32].*;
-    const legacy_session_id = random_buffer[32..64].*;
-    const x25519_kp_seed = random_buffer[64..96].*;
-    const secp256r1_kp_seed = random_buffer[96..128].*;
+    const keypair_seed = random_buffer[32..64].*;
+    const explicit_iv_random = random_buffer[64..72].*;
 
     var hash: MessageHashType = undefined;
     var next_cipher: ApplicationCipher = undefined;
@@ -143,18 +125,9 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     c.cleartext_slice = c.partially_read_buffer[0..0];
     const client_stream = ClientAndStream{ .c = &c, .s = stream };
 
-    const x25519_kp = crypto.dh.X25519.KeyPair.create(x25519_kp_seed) catch |err| switch (err) {
-        // Only possible to happen if the private key is all zeroes.
-        error.IdentityElement => return error.InsufficientEntropy,
-    };
-    const secp256r1_kp = crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.create(secp256r1_kp_seed) catch |err| switch (err) {
-        // Only possible to happen if the private key is all zeroes.
-        error.IdentityElement => return error.InsufficientEntropy,
-    };
-
     // 256 is enough for TLS 1.2
     var buf: [256]u8 = undefined;
-    const plaintext_header = makeClientHello(&buf, host, client_random, legacy_session_id);
+    const plaintext_header = makeClientHello(&buf, host, client_random);
 
     {
         var iovecs = [_]std.os.iovec_const{
@@ -166,6 +139,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
 
     const client_hello_bytes1 = plaintext_header[5..];
     var server_random: [32]u8 = undefined;
+    var extended_master_secret: bool = false;
 
     // In theory the certificate could be as long as 16MB though.
     var handshake_buffer: [16000]u8 = undefined;
@@ -181,16 +155,13 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         var hsd = try d.sub(length);
         try hsd.ensure(2 + 32);
         const legacy_version = hsd.decode(u16);
+        _ = legacy_version;
         server_random = hsd.array(32).*;
-        if (mem.eql(u8, &server_random, &tls.hello_retry_request_sequence)) {
-            // This is a HelloRetryRequest message. This client implementation
-            // does not expect to get one.
-            return error.TlsUnexpectedMessage;
-        }
         try hsd.ensure(1);
         const legacy_session_id_echo_len = hsd.decode(u8);
         try hsd.ensure(legacy_session_id_echo_len);
         const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
+        _ = legacy_session_id_echo;
         try hsd.ensure(2 + 1);
         cipher_suite_tag = hsd.decode(CipherSuite);
         const hash_tag = messageHash(getAEAD(cipher_suite_tag));
@@ -220,10 +191,9 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         }
         var all_extd = try hsd.sub(extensions_size);
         var supported_version: u16 = 0;
-        const have_shared_key = false;
         while (!all_extd.eof()) {
             try all_extd.ensure(2 + 2);
-            const et = all_extd.decode(tls.ExtensionType);
+            const et = all_extd.decode(ExtensionType);
             const ext_size = all_extd.decode(u16);
             var extd = try all_extd.sub(ext_size);
             switch (et) {
@@ -232,17 +202,18 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                     try extd.ensure(2);
                     supported_version = extd.decode(u16);
                 },
+                .extended_master_secret => {
+                    extended_master_secret = true;
+                },
+                .renegotiation_info => {
+                    c.secure_renegotiation = true;
+                    if (ext_size != 1) return error.TlsHandshakeFailure;
+                    try extd.ensure(1);
+                    if (extd.decode(u8) != 0) return error.TlsHandshakeFailure;
+                },
                 else => {},
             }
         }
-
-        const tls_version = if (supported_version == 0) legacy_version else supported_version;
-        if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_3)) {
-            if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id) or !have_shared_key)
-                return error.TlsIllegalParameter;
-        } else if (tls_version == @intFromEnum(tls.ProtocolVersion.tls_1_2)) {
-            // try tls12.init(&stream, ca_bundle, host, @as(tls12.CipherSuite, @enumFromInt(@intFromEnum(cipher_suite_tag))), &d, &ptd, x25519_kp, secp256r1_kp, hello_rand, server_random);
-        } else return error.TlsAlertProtocolVersion;
     }
 
     var main_cert_pub_key_algo: Certificate.AlgorithmCategory = undefined;
@@ -310,12 +281,11 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
 
     // Server Key Exchange Message
     var shared_key_buf: [48]u8 = undefined;
-    var shared_key: []const u8 = undefined;
     var named_group: tls.NamedGroup = undefined;
+    // First 4 bytes are group type and length
+    var server_key_bytes: []const u8 = undefined;
     const kea = getKeyExchangeAlgorithm(cipher_suite_tag);
-    if (kea == .RSA) {
-        shared_key = &shared_key_buf;
-    } else {
+    if (kea != .RSA) {
         try d.readAtLeastOurAmt(client_stream, 4);
         try d.ensure(4);
         const handshake_type = d.decode(HandshakeType);
@@ -338,37 +308,10 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         named_group = hsd.decode(tls.NamedGroup);
         const key_size = hsd.decode(u8);
         try hsd.ensure(key_size);
-        const parameter_bytes = hsd.buf[hsd.idx - 4 ..][0 .. 4 + key_size];
-        switch (named_group) {
-            .x25519 => {
-                const ksl = crypto.dh.X25519.public_length;
-                if (key_size != ksl) return error.TlsIllegalParameter;
-                const server_pub_key = hsd.array(ksl);
-
-                shared_key = &(crypto.dh.X25519.scalarmult(
-                    x25519_kp.secret_key,
-                    server_pub_key.*,
-                ) catch return error.TlsDecryptFailure);
-            },
-            .secp256r1 => {
-                const server_pub_key = hsd.slice(key_size);
-
-                const PublicKey = crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
-                const pk = PublicKey.fromSec1(server_pub_key) catch {
-                    return error.TlsDecryptFailure;
-                };
-                const mul = pk.p.mulPublic(secp256r1_kp.secret_key.bytes, .big) catch {
-                    return error.TlsDecryptFailure;
-                };
-                shared_key = &mul.affineCoordinates().x.toBytes(.big);
-            },
-            else => {
-                return error.TlsIllegalParameter;
-            },
-        }
+        server_key_bytes = hsd.buf[hsd.idx - 4 ..][0 .. 4 + key_size];
+        _ = hsd.slice(key_size);
 
         // verify certificate
-        // TODO: RFC 7627 Extended Master Secret Extension
         try hsd.ensure(4);
         const scheme = hsd.decode(tls.SignatureScheme);
         const sig_len = hsd.decode(u16);
@@ -377,11 +320,11 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
         const main_cert_pub_key = main_cert_pub_key_buf[0..main_cert_pub_key_len];
         var verify_buf: [64 + 256]u8 = undefined;
         // TODO: figure out an upper bound
-        assert(parameter_bytes.len < 256);
+        assert(server_key_bytes.len < 256);
         @memcpy(verify_buf[0..32], &client_random);
         @memcpy(verify_buf[32..64], &server_random);
-        @memcpy(verify_buf[64 .. 64 + parameter_bytes.len], parameter_bytes);
-        const verify_bytes = verify_buf[0 .. 64 + parameter_bytes.len];
+        @memcpy(verify_buf[64 .. 64 + server_key_bytes.len], server_key_bytes);
+        const verify_bytes = verify_buf[0 .. 64 + server_key_bytes.len];
 
         switch (scheme) {
             inline .ecdsa_secp256r1_sha256,
@@ -428,20 +371,53 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     }
 
     // Client Key Exchange
+    var shared_key: []const u8 = undefined;
     {
         var public_key_buf: [512]u8 = undefined;
         const public_key: []const u8 = switch (kea) {
             .ECDHE => switch (named_group) {
-                .x25519 => &x25519_kp.public_key,
-                .secp256r1 => &secp256r1_kp.public_key.toUncompressedSec1(),
+                .x25519 => blk: {
+                    const X25519 = crypto.dh.X25519;
+                    const ksl = X25519.public_length;
+                    if (server_key_bytes.len - 4 != ksl) return error.TlsIllegalParameter;
+
+                    const x25519_kp = X25519.KeyPair.create(keypair_seed) catch |err| switch (err) {
+                        // Only possible to happen if the private key is all zeroes.
+                        error.IdentityElement => return error.InsufficientEntropy,
+                    };
+
+                    shared_key = &(X25519.scalarmult(
+                        x25519_kp.secret_key,
+                        server_key_bytes[4 .. 4 + ksl].*,
+                    ) catch return error.TlsDecryptFailure);
+                    break :blk &x25519_kp.public_key;
+                },
+                .secp256r1 => blk: {
+                    const secp256r1 = crypto.sign.ecdsa.EcdsaP256Sha256;
+                    const pk = secp256r1.PublicKey.fromSec1(server_key_bytes[4..]) catch {
+                        return error.TlsDecryptFailure;
+                    };
+
+                    const secp256r1_kp = secp256r1.KeyPair.create(keypair_seed) catch |err| switch (err) {
+                        // Only possible to happen if the private key is all zeroes.
+                        error.IdentityElement => return error.InsufficientEntropy,
+                    };
+
+                    const mul = pk.p.mulPublic(secp256r1_kp.secret_key.bytes, .big) catch {
+                        return error.TlsDecryptFailure;
+                    };
+                    shared_key = &mul.affineCoordinates().x.toBytes(.big);
+                    break :blk &secp256r1_kp.public_key.toUncompressedSec1();
+                },
                 else => unreachable,
             },
-            .RSA => rsa: {
+            .RSA => blk: {
                 // 0x0303 for TLS 1.2
                 shared_key_buf[0] = 0x03;
                 shared_key_buf[1] = 0x03;
                 crypto.random.bytes(shared_key_buf[2..]);
-                break :rsa try Certificate.encryptPKCS1(&public_key_buf, &shared_key_buf, &main_cert_pub_key_buf);
+                shared_key = &shared_key_buf;
+                break :blk try Certificate.encryptPKCS1(&public_key_buf, &shared_key_buf, &main_cert_pub_key_buf);
             },
             .DHE => unreachable,
         };
@@ -491,16 +467,26 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     // Calculate Keys
     var master_secret: [48]u8 = undefined;
     {
-        const seed = client_random ++ server_random;
-        master_secret = switch (hash) {
-            inline else => |h| PRF(
-                crypto.auth.hmac.Hmac(@TypeOf(h)),
-                shared_key,
-                "master secret",
-                &seed,
-                48,
-            ),
-        };
+        switch (hash) {
+            inline else => |h| if (extended_master_secret) {
+                master_secret = PRF(
+                    crypto.auth.hmac.Hmac(@TypeOf(h)),
+                    shared_key,
+                    "extended master secret",
+                    &h.peek(),
+                    48,
+                );
+            } else {
+                const seed = client_random ++ server_random;
+                master_secret = PRF(
+                    crypto.auth.hmac.Hmac(@TypeOf(h)),
+                    shared_key,
+                    "master secret",
+                    &seed,
+                    48,
+                );
+            },
+        }
         // Key Expansion: note that AEAD do not need mac key
         const seed2 = server_random ++ client_random;
         switch (next_cipher) {
@@ -525,9 +511,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                     [1]u8{0} ** Cipher.explicit_nonce_len;
                 // RFC 9325, Section 7.2.1
                 // Use the sequency counter as GC, but also add some randomness to it
-                var explicit_iv_mask: [Cipher.explicit_nonce_len]u8 = undefined;
-                crypto.random.bytes(&explicit_iv_mask);
-                cipher.client_iv[implicit_nonce_len..].* = explicit_iv_mask;
+                cipher.client_iv[implicit_nonce_len..].* = explicit_iv_random[0..Cipher.explicit_nonce_len].*;
             },
         }
     }
@@ -841,7 +825,6 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         }
     }
     assert(c.cleartext_slice.len == 0);
-    assert(!c.received_close_notify);
 
     // Receive until we have a complete record
     while (true) {
@@ -875,6 +858,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
             // TODO: enable larger buffer
         };
 
+        assert(!c.received_close_notify);
         const received_len = try stream.readv(&ask_iovecs_buf);
         c.ciphertext_slice = c.partially_read_buffer[0 .. c.ciphertext_slice.len + received_len];
         if (received_len == 0) {
@@ -914,7 +898,9 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
                 _ = level;
 
                 try desc.toError();
+
                 assert(desc == tls.AlertDescription.close_notify);
+                c.received_close_notify = true;
                 c.ciphertext_slice = c.ciphertext_slice[end..];
                 break :decrypt;
             },
@@ -1009,7 +995,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
     return vp.total;
 }
 
-/// Move `frag[in..]` to the beginning of `frag`
+/// `@memcpy(dst, src)` but allows `dst.ptr + dst.len <= src.ptr`
 fn limitedOverlapCopy(dst: []u8, src: []u8) void {
     if (dst.len == 0 and src.len == 0) return;
     if (@intFromPtr(dst.ptr) + dst.len <= @intFromPtr(src.ptr)) {
@@ -1130,21 +1116,12 @@ const VecPut = struct {
 };
 
 pub const cipher_suites = tls.enum_array(CipherSuite, &.{
-    // .DHE_RSA_WITH_AES_128_GCM_SHA256,
-    .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-    // .DHE_PSK_WITH_AES_128_GCM_SHA256,
-    // .ECDHE_PSK_WITH_AES_128_GCM_SHA256,
     .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-    // .DHE_RSA_WITH_AES_256_GCM_SHA384,
-    .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-    // .DHE_PSK_WITH_AES_256_GCM_SHA384,
-    // .ECDHE_PSK_WITH_AES_256_GCM_SHA384,
+    .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
     .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-    // .DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-    // .DHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
-    // .ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+    .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 
     // Legacy
     .RSA_WITH_AES_128_GCM_SHA256,
@@ -1201,9 +1178,20 @@ pub const ECCurveType = enum(u8) {
     _,
 };
 
-pub const ec_point_formats: tls.ExtensionType = @enumFromInt(0xb);
-pub const extended_master_secret: tls.ExtensionType = @enumFromInt(0x17);
-pub const renegotiation_info: tls.ExtensionType = @enumFromInt(0xff01);
+pub const ExtensionType = enum(u16) {
+    server_name = 0,
+    supported_groups = 10,
+    ec_point_formats = 11,
+    signature_algorithms = 13,
+    extended_master_secret = 23,
+    supported_versions = 43,
+    renegotiation_info = 0xff01,
+    _,
+};
+
+pub inline fn extension(comptime et: ExtensionType, bytes: anytype) [2 + 2 + bytes.len]u8 {
+    return int2(@intFromEnum(et)) ++ array(1, bytes);
+}
 
 pub const ECPointFormat = enum(u8) {
     uncompressed = 0,

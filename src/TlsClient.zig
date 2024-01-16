@@ -7,7 +7,7 @@ const crypto = std.crypto;
 const assert = std.debug.assert;
 const Certificate = @import("crypto/Certificate.zig");
 
-const max_ciphertext_len = (1 << 14) + 2048;
+const max_ciphertext_len = 1 << 14;
 const int2 = tls.int2;
 const int3 = tls.int3;
 const array = tls.array;
@@ -52,6 +52,9 @@ pub fn makeClientHello(buf: []u8, host: []const u8, client_random: [32]u8) []con
     }) ++ extension(.signature_algorithms, enum_array(tls.SignatureScheme, &.{
         .ecdsa_secp256r1_sha256,
         .ecdsa_secp384r1_sha384,
+        .rsa_pss_rsae_sha256,
+        .rsa_pss_rsae_sha384,
+        .rsa_pss_rsae_sha512,
         .rsa_pkcs1_sha256,
         .rsa_pkcs1_sha384,
         .rsa_pkcs1_sha512,
@@ -342,6 +345,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
             .rsa_pkcs1_sha384,
             .rsa_pkcs1_sha512,
             => |comptime_scheme| {
+                if (main_cert_pub_key_algo != .rsaEncryption) return error.TlsBadSignatureScheme;
                 const Hash = SchemeHash(comptime_scheme);
                 try Certificate.verifyRsa(
                     Hash,
@@ -350,6 +354,25 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                     .rsaEncryption,
                     main_cert_pub_key,
                 );
+            },
+            inline .rsa_pss_rsae_sha256,
+            .rsa_pss_rsae_sha384,
+            .rsa_pss_rsae_sha512,
+            => |comptime_scheme| {
+                if (main_cert_pub_key_algo != .rsaEncryption) return error.TlsBadSignatureScheme;
+                const Hash = SchemeHash(comptime_scheme);
+                const rsa = Certificate.rsa;
+                const components = try rsa.PublicKey.parseDer(main_cert_pub_key);
+                const exponent = components.exponent;
+                const modulus = components.modulus;
+                switch (modulus.len) {
+                    inline 128, 256, 384, 512 => |modulus_len| {
+                        const key = try rsa.PublicKey.fromBytes(exponent, modulus);
+                        const sig = rsa.PSSSignature.fromBytes(modulus_len, encoded_sig);
+                        try rsa.PSSSignature.verify(modulus_len, sig, verify_bytes, key, Hash);
+                    },
+                    else => return error.TlsBadRsaSignatureBitCount,
+                }
             },
             else => return error.TlsBadSignatureScheme,
         }
@@ -679,8 +702,8 @@ fn prepareCiphertextRecord(
             while (true) {
                 const encrypted_content_len: u16 = @intCast(@min(
                     @min(bytes.len - bytes_i, max_ciphertext_len),
-                    ciphertext_buf.len - close_notify_alert_reserved -
-                        overhead_len - ciphertext_end,
+                    ciphertext_buf.len -| (close_notify_alert_reserved +
+                        overhead_len + ciphertext_end),
                 ));
                 if (encrypted_content_len == 0) return .{
                     .iovec_end = iovec_end,

@@ -19,12 +19,12 @@ test "Connect https" {
     var req = try client.open(.GET, uri, headers, .{ .max_redirects = 10 });
     defer req.deinit();
 
-    // The rest of a request lifecycle are skipped for testing
+    // The rest of a request lifecycle can be skipped for testing
 
-    // try req.send(.{ .raw_uri = true });
-    // try req.wait();
-    // const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
-    // defer allocator.free(body);
+    try req.send(.{});
+    try req.wait();
+    const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
+    defer allocator.free(body);
 
-    // std.debug.print("\n{s}: {s}\n", .{ url, std.fmt.fmtSliceEscapeLower(body[0..128]) });
+    std.debug.print("\n{s}: {s}\n", .{ url, std.fmt.fmtSliceEscapeLower(body[0..128]) });
 }

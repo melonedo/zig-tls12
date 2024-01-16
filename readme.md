@@ -31,7 +31,7 @@ pub fn main() !void {
     var req = try client.open(.GET, uri, headers, .{ .max_redirects = 10 });
     defer req.deinit();
 
-    try req.send(.{ .raw_uri = true });
+    try req.send(.{});
     try req.wait();
     const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(body);

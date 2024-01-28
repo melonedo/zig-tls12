@@ -7,7 +7,7 @@ The only difference of `HttpClient` from `std.http.Client` is that `std.crypto.t
 
 ## Example
 
-This is tested againt zig version `0.12.0-dev.2059+42389cb9c`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
+This is tested againt zig version `0.12.0-dev.2341+92211135f`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
 
 ```zig
 const std = @import("std");

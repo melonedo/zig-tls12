@@ -1,15 +1,16 @@
 const std = @import("std");
-const testing = std.testing;
 const HttpClient = @import("HttpClient.zig");
 
-test "Connect https" {
-    const allocator = testing.allocator;
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var client = HttpClient{ .allocator = allocator };
     defer client.deinit();
     try client.initDefaultProxies(allocator);
 
-    var buf: [256]u8 = undefined;
-    const url = try std.io.getStdIn().reader().readUntilDelimiter(&buf, '\n');
+    const url = "https://bing.com";
 
     const uri = try std.Uri.parse(url);
     var server_header_buffer: [1024 * 1024]u8 = undefined;
@@ -19,12 +20,10 @@ test "Connect https" {
     });
     defer req.deinit();
 
-    // The rest of a request lifecycle can be skipped for testing
-
     try req.send(.{});
     try req.wait();
     const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(body);
 
-    std.debug.print("\n{s}: {s}\n", .{ url, std.fmt.fmtSliceEscapeLower(body[0..128]) });
+    std.debug.print("{s}: {s}\n", .{ url, body });
 }

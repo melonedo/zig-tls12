@@ -9,7 +9,7 @@ pub fn main() !void {
     var client = HttpClient{ .allocator = allocator };
     defer client.deinit();
 
-    const url = "https://bing.com";
+    const url = "https://httpbin.org";
 
     const uri = try std.Uri.parse(url);
     var headers = std.http.Headers{ .allocator = allocator };

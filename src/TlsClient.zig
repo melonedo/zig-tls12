@@ -426,10 +426,10 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
                         error.IdentityElement => return error.InsufficientEntropy,
                     };
 
-                    const mul = pk.p.mulPublic(secp256r1_kp.secret_key.bytes, .big) catch {
+                    const mul = pk.p.mulPublic(secp256r1_kp.secret_key.bytes, .Big) catch {
                         return error.TlsDecryptFailure;
                     };
-                    shared_key = &mul.affineCoordinates().x.toBytes(.big);
+                    shared_key = &mul.affineCoordinates().x.toBytes(.Big);
                     break :blk &secp256r1_kp.public_key.toUncompressedSec1();
                 },
                 else => unreachable,
@@ -854,7 +854,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         // Skip `stream.readv` if there is a complete record unprocessed
         // This may happen when different types of traffic are mixed.
         if (c.ciphertext_slice.len > 5) {
-            const record_len = mem.readInt(u16, c.ciphertext_slice[3..5], .big);
+            const record_len = mem.readInt(u16, c.ciphertext_slice[3..5], .Big);
             if (record_len + 5 <= c.ciphertext_slice.len)
                 break;
         }
@@ -905,8 +905,8 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
 
         // Ensure a complete record is in `frag`
         const ct: tls.ContentType = @enumFromInt(frag[in]);
-        const legacy_version = mem.readInt(u16, frag[in..][1..3], .big);
-        const record_len = mem.readInt(u16, frag[in..][3..5], .big);
+        const legacy_version = mem.readInt(u16, frag[in..][1..3], .Big);
+        const record_len = mem.readInt(u16, frag[in..][3..5], .Big);
         if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
         in += 5;
         const end = in + record_len;
@@ -1035,8 +1035,8 @@ const native_endian = builtin.cpu.arch.endian();
 
 inline fn big(x: anytype) @TypeOf(x) {
     return switch (native_endian) {
-        .big => x,
-        .little => @byteSwap(x),
+        .Big => x,
+        .Little => @byteSwap(x),
     };
 }
 

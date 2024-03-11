@@ -68,8 +68,8 @@ pub fn rescan(cb: *Bundle, gpa: Allocator) RescanError!void {
     }
 }
 
-const rescanMac = @import("Bundle/macos.zig").rescanMac;
-const RescanMacError = @import("Bundle/macos.zig").RescanMacError;
+const rescanMac = std.crypto.Certificate.Bundle.rescan;
+const RescanMacError = std.crypto.Certificate.Bundle.RescanError;
 
 const RescanLinuxError = AddCertsFromFilePathError || AddCertsFromDirPathError;
 

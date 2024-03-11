@@ -20,19 +20,19 @@ pub fn rescanMac(cb: *Bundle, gpa: Allocator) RescanMacError!void {
     var stream = std.io.fixedBufferStream(bytes);
     const reader = stream.reader();
 
-    const db_header = try reader.readStructEndian(ApplDbHeader, .big);
+    const db_header = try reader.readStructBig(ApplDbHeader);
     assert(mem.eql(u8, "kych", &@as([4]u8, @bitCast(db_header.signature))));
 
     try stream.seekTo(db_header.schema_offset);
 
-    const db_schema = try reader.readStructEndian(ApplDbSchema, .big);
+    const db_schema = try reader.readStructBig(ApplDbSchema);
 
     var table_list = try gpa.alloc(u32, db_schema.table_count);
     defer gpa.free(table_list);
 
     var table_idx: u32 = 0;
     while (table_idx < table_list.len) : (table_idx += 1) {
-        table_list[table_idx] = try reader.readInt(u32, .big);
+        table_list[table_idx] = try reader.readIntBig(u32);
     }
 
     const now_sec = std.time.timestamp();
@@ -40,7 +40,7 @@ pub fn rescanMac(cb: *Bundle, gpa: Allocator) RescanMacError!void {
     for (table_list) |table_offset| {
         try stream.seekTo(db_header.schema_offset + table_offset);
 
-        const table_header = try reader.readStructEndian(TableHeader, .big);
+        const table_header = try reader.readStructBig(TableHeader);
 
         if (@as(std.os.darwin.cssm.DB_RECORDTYPE, @enumFromInt(table_header.table_id)) != .X509_CERTIFICATE) {
             continue;
@@ -51,13 +51,13 @@ pub fn rescanMac(cb: *Bundle, gpa: Allocator) RescanMacError!void {
 
         var record_idx: u32 = 0;
         while (record_idx < record_list.len) : (record_idx += 1) {
-            record_list[record_idx] = try reader.readInt(u32, .big);
+            record_list[record_idx] = try reader.readIntBig(u32);
         }
 
         for (record_list) |record_offset| {
             try stream.seekTo(db_header.schema_offset + table_offset + record_offset);
 
-            const cert_header = try reader.readStructEndian(X509CertHeader, .big);
+            const cert_header = try reader.readStructBig(X509CertHeader);
 
             try cb.bytes.ensureUnusedCapacity(gpa, cert_header.cert_size);
 

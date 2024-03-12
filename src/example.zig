@@ -1,4 +1,6 @@
 const std = @import("std");
+// With zon:    const HttpClient = @import("tls12");
+// With stdlib: const HttpClient = std.http.Client;
 const HttpClient = @import("HttpClient.zig");
 
 pub fn main() !void {
@@ -10,7 +12,7 @@ pub fn main() !void {
     defer client.deinit();
     try client.initDefaultProxies(allocator);
 
-    const url = "https://bing.com";
+    const url = "https://httpbin.org";
 
     const uri = try std.Uri.parse(url);
     var server_header_buffer: [1024 * 1024]u8 = undefined;

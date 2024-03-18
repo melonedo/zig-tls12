@@ -7,7 +7,8 @@ const crypto = std.crypto;
 const assert = std.debug.assert;
 const Certificate = @import("crypto/Certificate.zig");
 
-const max_ciphertext_len = 1 << 14;
+const max_cleartext_len = 1 << 14;
+const max_ciphertext_len = max_cleartext_len + 1024;
 const int2 = tls.int2;
 const int3 = tls.int3;
 const array = tls.array;
@@ -908,6 +909,8 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         const legacy_version = mem.readInt(u16, frag[in..][1..3], .big);
         const record_len = mem.readInt(u16, frag[in..][3..5], .big);
         if (record_len > max_ciphertext_len) return error.TlsRecordOverflow;
+        if (record_len > max_cleartext_len)
+            std.debug.print("{}", .{record_len});
         in += 5;
         const end = in + record_len;
         assert(end <= frag.len);
@@ -934,7 +937,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
 
         // Ideally, this buffer would never be used. It is needed when `iovecs` are
         // too small to fit the cleartext, which may be as large as `max_ciphertext_len`.
-        var cleartext_stack_buffer: [max_ciphertext_len]u8 = undefined;
+        var cleartext_stack_buffer: [max_cleartext_len]u8 = undefined;
         const cleartext = if (c.cipher) |cipher| switch (cipher) {
             inline else => |*p| c: {
                 const P = @TypeOf(p.*);

@@ -40,7 +40,7 @@ const HttpClient = @import("tls12");
 
 ## Example
 
-This is tested againt zig version `0.12.0-dev.3049+f803761e1`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
+This is tested againt zig version `0.12.0-dev.3366+8e7d9afda`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
 
 ```zig
 const std = @import("std");

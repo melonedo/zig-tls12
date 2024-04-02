@@ -134,7 +134,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
     const plaintext_header = makeClientHello(&buf, host, client_random);
 
     {
-        var iovecs = [_]std.os.iovec_const{
+        var iovecs = [_]std.posix.iovec_const{
             .{ .iov_base = plaintext_header.ptr, .iov_len = plaintext_header.len },
             .{ .iov_base = host.ptr, .iov_len = host.len },
         };
@@ -465,7 +465,7 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
             },
             .DHE => unreachable,
         };
-        var iovecs = [_]std.os.iovec_const{
+        var iovecs = [_]std.posix.iovec_const{
             .{ .iov_base = &record_header, .iov_len = record_header.len },
             .{ .iov_base = header.ptr, .iov_len = header.len },
             .{ .iov_base = public_key.ptr, .iov_len = public_key.len },
@@ -638,7 +638,7 @@ pub fn writeAllEnd(c: *Client, stream: std.net.Stream, bytes: []const u8, end: b
 /// TLS session, or a truncation attack.
 pub fn writeEnd(c: *Client, stream: std.net.Stream, bytes: []const u8, end: bool, inner_content_type: tls.ContentType) !usize {
     var ciphertext_buf: [tls.max_ciphertext_record_len * 4]u8 = undefined;
-    var iovecs_buf: [6]std.os.iovec_const = undefined;
+    var iovecs_buf: [6]std.posix.iovec_const = undefined;
     var prepared = prepareCiphertextRecord(c, &iovecs_buf, &ciphertext_buf, bytes, inner_content_type);
     if (end) {
         prepared.iovec_end += prepareCiphertextRecord(
@@ -686,7 +686,7 @@ const CiphertextRecordResult = struct {
 
 fn prepareCiphertextRecord(
     c: *Client,
-    iovecs: []std.os.iovec_const,
+    iovecs: []std.posix.iovec_const,
     ciphertext_buf: []u8,
     bytes: []const u8,
     inner_content_type: tls.ContentType,
@@ -766,7 +766,7 @@ pub fn eof(c: Client) bool {
 /// If the number read is less than `len` it means the stream reached the end.
 /// Reaching the end of the stream is not an error condition.
 pub fn readAtLeast(c: *Client, stream: std.net.Stream, buffer: []u8, len: usize) !usize {
-    var iovecs = [1]std.os.iovec{.{ .iov_base = buffer.ptr, .iov_len = buffer.len }};
+    var iovecs = [1]std.posix.iovec{.{ .iov_base = buffer.ptr, .iov_len = buffer.len }};
     return readvAtLeast(c, stream, &iovecs, len);
 }
 
@@ -789,7 +789,7 @@ pub fn readAll(c: *Client, stream: std.net.Stream, buffer: []u8) !usize {
 /// stream is not an error condition.
 /// The `iovecs` parameter is mutable because this function needs to mutate the fields in
 /// order to handle partial reads from the underlying stream layer.
-pub fn readv(c: *Client, stream: std.net.Stream, iovecs: []std.os.iovec) !usize {
+pub fn readv(c: *Client, stream: std.net.Stream, iovecs: []std.posix.iovec) !usize {
     return readvAtLeast(c, stream, iovecs, 1);
 }
 
@@ -800,7 +800,7 @@ pub fn readv(c: *Client, stream: std.net.Stream, iovecs: []std.os.iovec) !usize 
 /// Reaching the end of the stream is not an error condition.
 /// The `iovecs` parameter is mutable because this function needs to mutate the fields in
 /// order to handle partial reads from the underlying stream layer.
-pub fn readvAtLeast(c: *Client, stream: std.net.Stream, iovecs: []std.os.iovec, len: usize) !usize {
+pub fn readvAtLeast(c: *Client, stream: std.net.Stream, iovecs: []std.posix.iovec, len: usize) !usize {
     if (c.eof()) return 0;
 
     var off_i: usize = 0;
@@ -826,7 +826,7 @@ pub fn readvAtLeast(c: *Client, stream: std.net.Stream, iovecs: []std.os.iovec, 
 /// function asserts that `eof()` is `false`.
 /// See `readv` for a higher level function that has the same, familiar API as
 /// other read functions, such as `std.fs.File.read`.
-pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.iovec) !usize {
+pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.posix.iovec) !usize {
     var vp: VecPut = .{ .iovecs = iovecs };
 
     // Give away the buffered cleartext we have, if any.
@@ -874,7 +874,7 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.os.
         const remaining_partial_buffer = c.partially_read_buffer[c.ciphertext_slice.len..];
         assert(remaining_partial_buffer.len != 0);
 
-        var ask_iovecs_buf = [_]std.os.iovec{
+        var ask_iovecs_buf = [_]std.posix.iovec{
             .{
                 .iov_base = remaining_partial_buffer.ptr,
                 .iov_len = remaining_partial_buffer.len,
@@ -1081,7 +1081,7 @@ pub const MessageHashType = union(HashName) {
 
 /// Abstraction for sending multiple byte buffers to a slice of iovecs.
 const VecPut = struct {
-    iovecs: []const std.os.iovec,
+    iovecs: []const std.posix.iovec,
     idx: usize = 0,
     off: usize = 0,
     total: usize = 0,

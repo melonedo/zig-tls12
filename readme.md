@@ -40,7 +40,7 @@ const HttpClient = @import("tls12");
 
 ## Example
 
-This is tested againt zig version `0.12.0-dev.3518+d2be725e4`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
+This is tested againt zig version `0.12.0-dev.3674+a0de07760`. Zig's HTTP interface has changed so it DOES NOT WORK on 0.11 and below.
 
 ```zig
 const std = @import("std");
@@ -67,7 +67,7 @@ pub fn main() !void {
     });
     defer req.deinit();
 
-    try req.send(.{});
+    try req.send();
     try req.wait();
     const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(body);

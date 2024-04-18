@@ -22,7 +22,7 @@ pub fn main() !void {
     });
     defer req.deinit();
 
-    try req.send(.{});
+    try req.send();
     try req.wait();
     const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(body);

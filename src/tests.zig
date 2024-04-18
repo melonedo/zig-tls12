@@ -21,7 +21,7 @@ test "Connect https" {
 
     // The rest of a request lifecycle can be skipped for testing
 
-    try req.send(.{});
+    try req.send();
     try req.wait();
     const body = try req.reader().readAllAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(body);

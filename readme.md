@@ -29,7 +29,7 @@ const tls12 = b.dependency("tls12", .{
     .target = target,
     .optimize = optimize,
 });
-exe.addModule("tls12", tls12.module("zig-tls12"));
+exe.root_module.addImport("tls12", tls12.module("zig-tls12"));
 ```
 
 In zig program:

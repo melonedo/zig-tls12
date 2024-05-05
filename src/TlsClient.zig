@@ -135,8 +135,8 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
 
     {
         var iovecs = [_]std.posix.iovec_const{
-            .{ .iov_base = plaintext_header.ptr, .iov_len = plaintext_header.len },
-            .{ .iov_base = host.ptr, .iov_len = host.len },
+            .{ .base = plaintext_header.ptr, .len = plaintext_header.len },
+            .{ .base = host.ptr, .len = host.len },
         };
         try stream.writevAll(&iovecs);
     }
@@ -466,9 +466,9 @@ pub fn init(stream: std.net.Stream, ca_bundle: Certificate.Bundle, host: []const
             .DHE => unreachable,
         };
         var iovecs = [_]std.posix.iovec_const{
-            .{ .iov_base = &record_header, .iov_len = record_header.len },
-            .{ .iov_base = header.ptr, .iov_len = header.len },
-            .{ .iov_base = public_key.ptr, .iov_len = public_key.len },
+            .{ .base = &record_header, .len = record_header.len },
+            .{ .base = header.ptr, .len = header.len },
+            .{ .base = public_key.ptr, .len = public_key.len },
         };
         try stream.writevAll(&iovecs);
         switch (hash) {
@@ -659,8 +659,8 @@ pub fn writeEnd(c: *Client, stream: std.net.Stream, bytes: []const u8, end: bool
     var total_amt: usize = 0;
     while (true) {
         var amt = try stream.writev(iovecs_buf[i..iovec_end]);
-        while (amt >= iovecs_buf[i].iov_len) {
-            const encrypted_amt = iovecs_buf[i].iov_len;
+        while (amt >= iovecs_buf[i].len) {
+            const encrypted_amt = iovecs_buf[i].len;
             total_amt += encrypted_amt - overhead_len;
             amt -= encrypted_amt;
             i += 1;
@@ -672,8 +672,8 @@ pub fn writeEnd(c: *Client, stream: std.net.Stream, bytes: []const u8, end: bool
             // not sent; otherwise the caller would not know to retry the call.
             if (amt == 0 and (!end or i < iovec_end - 1)) return total_amt;
         }
-        iovecs_buf[i].iov_base += amt;
-        iovecs_buf[i].iov_len -= amt;
+        iovecs_buf[i].base += amt;
+        iovecs_buf[i].len -= amt;
     }
 }
 
@@ -745,8 +745,8 @@ fn prepareCiphertextRecord(
 
                 const record = ciphertext_buf[record_start..ciphertext_end];
                 iovecs[iovec_end] = .{
-                    .iov_base = record.ptr,
-                    .iov_len = record.len,
+                    .base = record.ptr,
+                    .len = record.len,
                 };
                 iovec_end += 1;
             }
@@ -766,7 +766,7 @@ pub fn eof(c: Client) bool {
 /// If the number read is less than `len` it means the stream reached the end.
 /// Reaching the end of the stream is not an error condition.
 pub fn readAtLeast(c: *Client, stream: std.net.Stream, buffer: []u8, len: usize) !usize {
-    var iovecs = [1]std.posix.iovec{.{ .iov_base = buffer.ptr, .iov_len = buffer.len }};
+    var iovecs = [1]std.posix.iovec{.{ .base = buffer.ptr, .len = buffer.len }};
     return readvAtLeast(c, stream, &iovecs, len);
 }
 
@@ -809,12 +809,12 @@ pub fn readvAtLeast(c: *Client, stream: std.net.Stream, iovecs: []std.posix.iove
         var amt = try c.readvAdvanced(stream, iovecs[vec_i..]);
         off_i += amt;
         if (c.eof() or off_i >= len) return off_i;
-        while (amt >= iovecs[vec_i].iov_len) {
-            amt -= iovecs[vec_i].iov_len;
+        while (amt >= iovecs[vec_i].len) {
+            amt -= iovecs[vec_i].len;
             vec_i += 1;
         }
-        iovecs[vec_i].iov_base += amt;
-        iovecs[vec_i].iov_len -= amt;
+        iovecs[vec_i].base += amt;
+        iovecs[vec_i].len -= amt;
     }
 }
 
@@ -876,8 +876,8 @@ pub fn readvAdvanced(c: *Client, stream: std.net.Stream, iovecs: []const std.pos
 
         var ask_iovecs_buf = [_]std.posix.iovec{
             .{
-                .iov_base = remaining_partial_buffer.ptr,
-                .iov_len = remaining_partial_buffer.len,
+                .base = remaining_partial_buffer.ptr,
+                .len = remaining_partial_buffer.len,
             },
             // TODO: enable larger buffer
         };
@@ -1093,12 +1093,12 @@ const VecPut = struct {
         var bytes_i: usize = 0;
         while (true) {
             const v = vp.iovecs[vp.idx];
-            const dest = v.iov_base[vp.off..v.iov_len];
+            const dest = v.base[vp.off..v.len];
             const src = bytes[bytes_i..][0..@min(dest.len, bytes.len - bytes_i)];
             @memcpy(dest[0..src.len], src);
             bytes_i += src.len;
             vp.off += src.len;
-            if (vp.off >= v.iov_len) {
+            if (vp.off >= v.len) {
                 vp.off = 0;
                 vp.idx += 1;
                 if (vp.idx >= vp.iovecs.len) {
@@ -1117,7 +1117,7 @@ const VecPut = struct {
     fn peek(vp: VecPut) []u8 {
         if (vp.idx >= vp.iovecs.len) return &.{};
         const v = vp.iovecs[vp.idx];
-        return v.iov_base[vp.off..v.iov_len];
+        return v.base[vp.off..v.len];
     }
 
     // After writing to the result of peek(), one can call next() to
@@ -1125,7 +1125,7 @@ const VecPut = struct {
     fn next(vp: *VecPut, len: usize) void {
         vp.total += len;
         vp.off += len;
-        if (vp.off >= vp.iovecs[vp.idx].iov_len) {
+        if (vp.off >= vp.iovecs[vp.idx].len) {
             vp.off = 0;
             vp.idx += 1;
         }
@@ -1134,9 +1134,9 @@ const VecPut = struct {
     fn freeSize(vp: VecPut) usize {
         if (vp.idx >= vp.iovecs.len) return 0;
         var total: usize = 0;
-        total += vp.iovecs[vp.idx].iov_len - vp.off;
+        total += vp.iovecs[vp.idx].len - vp.off;
         if (vp.idx + 1 >= vp.iovecs.len) return total;
-        for (vp.iovecs[vp.idx + 1 ..]) |v| total += v.iov_len;
+        for (vp.iovecs[vp.idx + 1 ..]) |v| total += v.len;
         return total;
     }
 };

@@ -1,6 +1,7 @@
 buffer: []const u8,
 index: u32,
 const std = @import("std");
+const StaticStringMap = std.static_string_map.StaticStringMap;
 pub const Bundle = @import("Bundle.zig");
 
 pub const Version = enum { v1, v2, v3 };
@@ -18,7 +19,7 @@ pub const Algorithm = enum {
     md2WithRSAEncryption,
     md5WithRSAEncryption,
 
-    pub const map = std.ComptimeStringMap(Algorithm, .{
+    pub const map = StaticStringMap(Algorithm).initComptime(.{
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05 }, .sha1WithRSAEncryption },
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B }, .sha256WithRSAEncryption },
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C }, .sha384WithRSAEncryption },
@@ -49,7 +50,7 @@ pub const AlgorithmCategory = enum {
     rsaEncryption,
     X9_62_id_ecPublicKey,
 
-    pub const map = std.ComptimeStringMap(AlgorithmCategory, .{
+    pub const map = StaticStringMap(AlgorithmCategory).initComptime(.{
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 }, .rsaEncryption },
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 }, .X9_62_id_ecPublicKey },
     });
@@ -69,7 +70,7 @@ pub const Attribute = enum {
     pkcs9_emailAddress,
     domainComponent,
 
-    pub const map = std.ComptimeStringMap(Attribute, .{
+    pub const map = StaticStringMap(Attribute).initComptime(.{
         .{ &[_]u8{ 0x55, 0x04, 0x03 }, .commonName },
         .{ &[_]u8{ 0x55, 0x04, 0x05 }, .serialNumber },
         .{ &[_]u8{ 0x55, 0x04, 0x06 }, .countryName },
@@ -90,7 +91,7 @@ pub const NamedCurve = enum {
     secp521r1,
     X9_62_prime256v1,
 
-    pub const map = std.ComptimeStringMap(NamedCurve, .{
+    pub const map = StaticStringMap(NamedCurve).initComptime(.{
         .{ &[_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x22 }, .secp384r1 },
         .{ &[_]u8{ 0x2B, 0x81, 0x04, 0x00, 0x23 }, .secp521r1 },
         .{ &[_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 }, .X9_62_prime256v1 },
@@ -126,7 +127,7 @@ pub const ExtensionId = enum {
     netscape_cert_type,
     netscape_comment,
 
-    pub const map = std.ComptimeStringMap(ExtensionId, .{
+    pub const map = StaticStringMap(ExtensionId).initComptime(.{
         .{ &[_]u8{ 0x55, 0x04, 0x03 }, .commonName },
         .{ &[_]u8{ 0x55, 0x1D, 0x01 }, .authority_key_identifier },
         .{ &[_]u8{ 0x55, 0x1D, 0x07 }, .subject_alt_name },

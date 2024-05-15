@@ -16,14 +16,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     _ = b.addModule("zig-tls12", .{
-        .root_source_file = .{ .path = "src/HttpClient.zig" },
+        .root_source_file = b.path("src/HttpClient.zig"),
     });
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const main_tests = b.addTest(.{
         .name = "tests",
-        .root_source_file = .{ .path = "src/tests.zig" },
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
